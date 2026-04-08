@@ -281,4 +281,4 @@ uv run mypy src
 uv run pytest
 ```
 
-This repository currently does not include a `LICENSE` file.
+This project is licensed under the MIT License. See the `LICENSE` file for details.
