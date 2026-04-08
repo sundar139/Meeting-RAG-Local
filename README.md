@@ -295,7 +295,7 @@ Request flow (chat):
 
 What went wrong:
 
-- Running path-based commands such as uv run python scripts/ingest_many_meetings.py failed with ModuleNotFoundError for scripts package imports.
+- Running path-based commands such as uv run python scripts/ingest_many_meetings.py main --turns-dir data/processed failed with ModuleNotFoundError for scripts package imports.
 
 Resolution:
 
@@ -389,7 +389,7 @@ uv sync --group dev
 uv sync --group dev --extra data --extra services
 ```
 
-- Include GPU extras when required:
+- Required for transcription and diarization commands below:
 
 ```bash
 uv sync --group dev --extra data --extra services --extra gpu
@@ -398,16 +398,19 @@ uv sync --group dev --extra data --extra services --extra gpu
 4) Initialize database.
 
 ```bash
-createdb meeting_pipeline
+# must match POSTGRES_DB in .env
+createdb meeting_rag
 uv run python scripts/run_migrations.py
 ```
 
 5) Prepare Ollama models.
 
 ```bash
-ollama serve
 ollama pull nomic-embed-text-v2-moe
 ollama pull qwen3:4b
+
+# if Ollama is not already running as a background service, start it in a separate terminal
+ollama serve
 ```
 
 6) Optional retrieval chunk tuning.
@@ -421,6 +424,7 @@ RETRIEVAL_CHUNK_OVERLAP_SECONDS=15
 ### End-to-end pipeline example
 
 ```bash
+# Requires GPU extras: uv sync --group dev --extra data --extra services --extra gpu
 uv run python scripts/parse_ami_xml.py --meeting-id ES2002a --input-dir data/raw/ami --output-dir data/interim
 uv run python scripts/run_transcription.py --audio-path data/raw/ami/ES2002a.Mix-Headset.wav --meeting-id ES2002a --output-dir data/interim
 uv run python scripts/run_diarization.py --audio-path data/raw/ami/ES2002a.Mix-Headset.wav --meeting-id ES2002a --output-dir data/interim
@@ -440,7 +444,7 @@ uv run python scripts/ingest_embeddings.py --meeting-id ES2002a --turns-path dat
 - Batch ingestion:
 
 ```bash
-uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --retrieval-chunk-window-seconds 45 --retrieval-chunk-overlap-seconds 15
+uv run python scripts/ingest_many_meetings.py main --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --retrieval-chunk-window-seconds 45 --retrieval-chunk-overlap-seconds 15
 ```
 
 - Multi-meeting discovery plan:
@@ -495,7 +499,7 @@ uv run python scripts/ingest_many_meetings.py discover --raw-ami-dir data/raw/am
 4. Ingest many processed meetings safely:
 
 ```bash
-uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --discovery-source both
+uv run python scripts/ingest_many_meetings.py main --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --discovery-source both
 ```
 
 5. Launch app and refresh metadata if needed:
@@ -517,7 +521,7 @@ uv run python scripts/run_migrations.py
 2. Re-ingest meetings with replacement enabled to rebuild retrieval chunks:
 
 ```bash
-uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --replace-existing --batch-size 16 --discovery-source both
+uv run python scripts/ingest_many_meetings.py main --raw-ami-dir data/raw/ami --turns-dir data/processed --replace-existing --batch-size 16 --discovery-source both
 ```
 
 ## Running Tests and Quality Checks
