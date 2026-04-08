@@ -9,7 +9,11 @@ import typer
 
 from meeting_pipeline.db.connection import connection_scope
 from meeting_pipeline.db.repository import ConnectionProtocol, TranscriptChunkRepository
-from scripts.ingest_many_meetings import _discover_meeting_ids_from_words_xml
+
+try:
+    from scripts.ingest_many_meetings import _discover_meeting_ids_from_words_xml
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from ingest_many_meetings import _discover_meeting_ids_from_words_xml
 
 LOGGER = logging.getLogger(__name__)
 app = typer.Typer(help="Report AMI meeting readiness across raw/interim/processed/DB assets.")

@@ -8,7 +8,11 @@ import typer
 
 from meeting_pipeline.db.connection import connection_scope
 from meeting_pipeline.db.repository import ConnectionProtocol, TranscriptChunkRepository
-from scripts.ingest_embeddings import ingest_embeddings
+
+try:
+    from scripts.ingest_embeddings import ingest_embeddings
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from ingest_embeddings import ingest_embeddings
 
 LOGGER = logging.getLogger(__name__)
 app = typer.Typer(help="Batch embedding ingestion across many AMI meeting IDs.")
