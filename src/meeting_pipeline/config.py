@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     ollama_model: str = "nomic-embed-text-v2-moe"
     ollama_chat_model: str = "llama3.2:3b-instruct"
 
+    default_factoid_top_k: int = Field(default=5, ge=1)
+    speaker_specific_top_k: int = Field(default=4, ge=1)
+    action_items_or_decisions_top_k: int = Field(default=8, ge=1)
+    broad_summary_top_k: int = Field(default=14, ge=1)
+    meta_or_confidence_top_k: int = Field(default=6, ge=1)
+    broad_summary_max_candidates: int = Field(default=28, ge=1)
+
     whisperx_model: str = "large-v3"
     whisperx_device: Literal["cuda", "cpu"] = "cuda"
     whisperx_compute_type: str = "float16"

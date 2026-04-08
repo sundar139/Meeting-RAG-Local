@@ -11,6 +11,7 @@ from meeting_pipeline.db.connection import DatabaseConnectionError
 from meeting_pipeline.db.repository import TranscriptChunk
 from meeting_pipeline.embeddings.ollama_client import OllamaUnavailableError
 from meeting_pipeline.rag.models import (
+    ConversationState,
     GroundedAnswerResult,
     RetrievalBundle,
 )
@@ -80,18 +81,21 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
             user_query: str,
             *,
             conversation_context: list[str] | None = None,
-            top_k: int = 5,
+            top_k: int | None = None,
+            conversation_state: ConversationState | None = None,
         ) -> RetrievalBundle:
             _ = meeting_id
             _ = user_query
             _ = conversation_context
             _ = top_k
+            _ = conversation_state
             return RetrievalBundle(
                 meeting_id="m1",
                 user_query="What decisions were made?",
                 rewritten_query="meeting decisions",
                 top_k_used=5,
                 results=[],
+                retrieval_mode="default_factoid",
             )
 
     class FakeAnswerGenerator:
@@ -103,12 +107,16 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
             retrieved_evidence: list[object],
             rewritten_query: str,
             conversation_context: list[str] | None = None,
+            retrieval_mode: str = "default_factoid",
+            recent_state: ConversationState | None = None,
         ) -> GroundedAnswerResult:
             _ = user_question
             _ = meeting_id
             _ = retrieved_evidence
             _ = rewritten_query
             _ = conversation_context
+            _ = retrieval_mode
+            _ = recent_state
             return GroundedAnswerResult(
                 meeting_id="m1",
                 question="What decisions were made?",
@@ -125,10 +133,14 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
         conversation_context=[],
         retriever=FakeRetriever(),
         answer_generator=FakeAnswerGenerator(),
+        conversation_state=None,
     )
 
     assert bundle.results == []
     assert answer.insufficient_context is True
+    timings = answer.service_metadata.get("timings_ms")
+    assert isinstance(timings, dict)
+    assert "total_request" in timings
 
 
 def test_user_facing_error_message_maps_known_service_errors() -> None:

@@ -1,6 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
+
+QueryRelation = Literal[
+    "standalone_direct",
+    "followup_previous",
+    "meta_chat_scope",
+]
+
+RetrievalMode = Literal[
+    "speaker_specific",
+    "action_items_or_decisions",
+    "broad_summary",
+    "meta_or_confidence",
+    "default_factoid",
+]
 
 
 @dataclass(frozen=True)
@@ -8,6 +23,8 @@ class QueryRewriteResult:
     original_query: str
     rewritten_query: str
     used_fallback: bool
+    question_relation: QueryRelation = "standalone_direct"
+    was_lossy: bool = False
 
 
 @dataclass(frozen=True)
@@ -28,6 +45,11 @@ class RetrievalBundle:
     rewritten_query: str
     top_k_used: int
     results: list[RetrievedChunk]
+    retrieval_mode: RetrievalMode = "default_factoid"
+    question_relation: QueryRelation = "standalone_direct"
+    used_cached_context: bool = False
+    speaker_filter: str | None = None
+    service_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -38,3 +60,28 @@ class GroundedAnswerResult:
     sections: dict[str, str]
     raw_answer: str
     insufficient_context: bool
+    service_metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FormatDirectives:
+    bullet_count: int | None = None
+    use_table: bool = False
+    short_summary: bool = False
+    action_items_only: bool = False
+
+
+@dataclass(frozen=True)
+class ConversationTurnState:
+    question: str
+    rewritten_query: str
+    retrieval_mode: RetrievalMode
+    answer_summary: str
+    insufficient_context: bool
+
+
+@dataclass(frozen=True)
+class ConversationState:
+    latest_bundle: RetrievalBundle | None = None
+    latest_answer: GroundedAnswerResult | None = None
+    recent_turns: list[ConversationTurnState] | None = None

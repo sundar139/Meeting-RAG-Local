@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any, Protocol, cast
 
 from meeting_pipeline.app import components
@@ -19,8 +20,16 @@ from meeting_pipeline.embeddings.ollama_client import (
     OllamaUnavailableError,
 )
 from meeting_pipeline.rag.answer_generator import AnswerGenerator
-from meeting_pipeline.rag.models import GroundedAnswerResult, RetrievalBundle
+from meeting_pipeline.rag.models import (
+    ConversationState,
+    ConversationTurnState,
+    GroundedAnswerResult,
+    RetrievalBundle,
+    RetrievalMode,
+    RetrievedChunk,
+)
 from meeting_pipeline.rag.retriever import Retriever
+from meeting_pipeline.timing import elapsed_ms, now
 
 
 class RetrieverProtocol(Protocol):
@@ -30,7 +39,8 @@ class RetrieverProtocol(Protocol):
         user_query: str,
         *,
         conversation_context: list[str] | None = None,
-        top_k: int = 5,
+        top_k: int | None = None,
+        conversation_state: ConversationState | None = None,
     ) -> RetrievalBundle: ...
 
 
@@ -40,9 +50,11 @@ class AnswerGeneratorProtocol(Protocol):
         *,
         user_question: str,
         meeting_id: str,
-        retrieved_evidence: Sequence[Any],
+        retrieved_evidence: Sequence[RetrievedChunk],
         rewritten_query: str,
         conversation_context: Sequence[str] | None = None,
+        retrieval_mode: RetrievalMode = "default_factoid",
+        recent_state: ConversationState | None = None,
     ) -> GroundedAnswerResult: ...
 
 
@@ -66,6 +78,7 @@ def _ensure_session_state(state: SessionStateProtocol) -> None:
         "latest_rewritten_query": "",
         "latest_evidence_bundle": None,
         "latest_answer": None,
+        "recent_turn_states": [],
         "pending_question": None,
     }
     for key, value in defaults.items():
@@ -79,6 +92,7 @@ def _reset_chat_state(state: SessionStateProtocol) -> None:
     state["latest_rewritten_query"] = ""
     state["latest_evidence_bundle"] = None
     state["latest_answer"] = None
+    state["recent_turn_states"] = []
     state["pending_question"] = None
 
 
@@ -136,38 +150,56 @@ def _build_assistant_message(answer: GroundedAnswerResult) -> str:
         return summary
     if answer.insufficient_context:
         return (
-            "Retrieved evidence was not sufficient to provide a grounded answer. "
-            "Try refining the question or increasing evidence top-k."
+            "Supporting evidence was limited for this question. "
+            "Try broadening scope, asking for a whole-meeting summary, or increasing top-k."
         )
     return "Answer generated from retrieved evidence."
 
 
 def _user_facing_error_message(error: Exception) -> str:
     if isinstance(error, DatabaseConnectionError):
-        return "PostgreSQL is unavailable. Verify DB settings and ensure the server is running."
+        return (
+            "Database unavailable. Confirm PostgreSQL is running and "
+            "POSTGRES_* values are correct."
+        )
     if isinstance(error, OllamaUnavailableError):
-        return "Ollama is unavailable. Start Ollama and verify OLLAMA_HOST."
+        return "Ollama unavailable. Start `ollama serve` and verify OLLAMA_HOST."
     if isinstance(error, OllamaModelNotFoundError):
-        return "Required Ollama model is missing. Pull the configured embedding/chat models."
+        return "Configured Ollama model was not found. Pull OLLAMA_MODEL and OLLAMA_CHAT_MODEL."
     if isinstance(error, OllamaMalformedResponseError):
-        return "Ollama returned malformed output. Try again or switch models."
+        return "Ollama returned an invalid response. Retry once or switch models."
     return "The requested operation failed. Please retry or check local services."
+
+
+def _extract_timing_map(metadata: dict[str, object]) -> dict[str, float]:
+    raw = metadata.get("timings_ms")
+    if not isinstance(raw, dict):
+        return {}
+
+    parsed: dict[str, float] = {}
+    for key, value in raw.items():
+        if isinstance(key, str) and isinstance(value, (int, float)):
+            parsed[key] = float(value)
+    return parsed
 
 
 def _run_rag_services(
     *,
     meeting_id: str,
     user_question: str,
-    top_k: int,
+    top_k: int | None,
     conversation_context: list[str],
     retriever: RetrieverProtocol,
     answer_generator: AnswerGeneratorProtocol,
+    conversation_state: ConversationState | None = None,
 ) -> tuple[RetrievalBundle, GroundedAnswerResult]:
+    request_started_at = now()
     bundle = retriever.retrieve(
         meeting_id=meeting_id,
         user_query=user_question,
         conversation_context=conversation_context,
         top_k=top_k,
+        conversation_state=conversation_state,
     )
     answer = answer_generator.generate(
         user_question=user_question,
@@ -175,7 +207,16 @@ def _run_rag_services(
         rewritten_query=bundle.rewritten_query,
         retrieved_evidence=bundle.results,
         conversation_context=conversation_context,
+        retrieval_mode=bundle.retrieval_mode,
+        recent_state=conversation_state,
     )
+    merged_timings = _extract_timing_map(bundle.service_metadata)
+    merged_timings.update(_extract_timing_map(answer.service_metadata))
+    merged_timings["total_request"] = elapsed_ms(request_started_at)
+
+    service_metadata = dict(answer.service_metadata)
+    service_metadata["timings_ms"] = merged_timings
+    answer = replace(answer, service_metadata=service_metadata)
     return bundle, answer
 
 
@@ -202,8 +243,9 @@ def _execute_chat_turn(
     *,
     meeting_id: str,
     user_question: str,
-    top_k: int,
+    top_k: int | None,
     conversation_context: list[str],
+    conversation_state: ConversationState | None,
 ) -> tuple[RetrievalBundle, GroundedAnswerResult]:
     with connection_scope(application_name="meeting_pipeline:streamlit_retrieve") as connection:
         searcher = PgVectorSearcher(connection)
@@ -216,6 +258,7 @@ def _execute_chat_turn(
             conversation_context=conversation_context,
             retriever=retriever,
             answer_generator=answer_generator,
+            conversation_state=conversation_state,
         )
 
 
@@ -232,7 +275,10 @@ def main() -> None:
 
     st.sidebar.header("Controls")
     debug_mode = st.sidebar.checkbox("Show technical errors", value=False)
-    top_k = st.sidebar.slider("Evidence top-k", min_value=1, max_value=10, value=5)
+    override_top_k = st.sidebar.checkbox("Override adaptive top-k", value=False)
+    top_k_override: int | None = None
+    if override_top_k:
+        top_k_override = st.sidebar.slider("Evidence top-k", min_value=1, max_value=20, value=8)
 
     try:
         with st.spinner("Loading meetings..."):
@@ -246,7 +292,8 @@ def main() -> None:
     if not available_meetings:
         components.render_empty_state(
             "No meetings available",
-            "No ingested meeting data was found. Run the ingestion step, then reload this app.",
+            "No ingested meeting data found. Run embedding ingestion for at least one meeting, "
+            "then reload.",
         )
         return
 
@@ -257,6 +304,7 @@ def main() -> None:
         options=available_meetings,
         index=default_index,
     )
+    st.sidebar.caption(f"Meetings available: {len(available_meetings)}")
     _apply_meeting_selection(state, selected_meeting)
 
     if st.sidebar.button("Clear chat", use_container_width=True):
@@ -310,11 +358,21 @@ def main() -> None:
             rewritten_query = str(turn["rewritten_query"])
             answer = turn["answer"]
             evidence = turn["evidence"]
+            turn_top_k = int(turn.get("top_k_used", 0) or 0)
+            turn_service_metadata = cast(dict[str, object], turn.get("service_metadata") or {})
 
             with st.chat_message("user"):
                 st.write(question)
 
             with st.chat_message("assistant"):
+                components.render_response_diagnostics(
+                    retrieval_mode=str(turn.get("retrieval_mode", "default_factoid")),
+                    top_k_used=max(turn_top_k, 1),
+                    used_cached_context=bool(turn.get("used_cached_context", False)),
+                    insufficient_context=bool(answer.insufficient_context),
+                    service_metadata=turn_service_metadata,
+                    show_latency=debug_mode,
+                )
                 st.caption(f"Rewritten query: {rewritten_query}")
                 components.render_answer_sections(answer)
                 with st.expander("Evidence"):
@@ -331,11 +389,17 @@ def main() -> None:
             try:
                 with st.spinner("Retrieving evidence and generating grounded answer..."):
                     context = _build_conversation_context(state["chat_messages"])
+                    conversation_state = ConversationState(
+                        latest_bundle=state.get("latest_evidence_bundle"),
+                        latest_answer=state.get("latest_answer"),
+                        recent_turns=state.get("recent_turn_states") or [],
+                    )
                     bundle, answer = _execute_chat_turn(
                         meeting_id=selected_meeting,
                         user_question=question,
-                        top_k=top_k,
+                        top_k=top_k_override,
                         conversation_context=context,
+                        conversation_state=conversation_state,
                     )
             except Exception as exc:
                 components.render_warning(_user_facing_error_message(exc))
@@ -350,16 +414,39 @@ def main() -> None:
             assistant_message = _build_assistant_message(answer)
             state["chat_messages"].append({"role": "user", "content": question})
             state["chat_messages"].append({"role": "assistant", "content": assistant_message})
+            state["recent_turn_states"].append(
+                ConversationTurnState(
+                    question=question,
+                    rewritten_query=bundle.rewritten_query,
+                    retrieval_mode=bundle.retrieval_mode,
+                    answer_summary=answer.sections.get("Summary", ""),
+                    insufficient_context=answer.insufficient_context,
+                )
+            )
+            if len(state["recent_turn_states"]) > 10:
+                state["recent_turn_states"] = state["recent_turn_states"][-10:]
             state["chat_history"].append(
                 {
                     "question": question,
                     "rewritten_query": bundle.rewritten_query,
                     "answer": answer,
                     "evidence": bundle.results,
+                    "retrieval_mode": bundle.retrieval_mode,
+                    "top_k_used": bundle.top_k_used,
+                    "used_cached_context": bundle.used_cached_context,
+                    "service_metadata": answer.service_metadata,
                 }
             )
 
             with st.chat_message("assistant"):
+                components.render_response_diagnostics(
+                    retrieval_mode=bundle.retrieval_mode,
+                    top_k_used=bundle.top_k_used,
+                    used_cached_context=bundle.used_cached_context,
+                    insufficient_context=answer.insufficient_context,
+                    service_metadata=answer.service_metadata,
+                    show_latency=debug_mode,
+                )
                 st.caption(f"Rewritten query: {bundle.rewritten_query}")
                 components.render_answer_sections(answer)
                 with st.expander("Evidence", expanded=answer.insufficient_context):

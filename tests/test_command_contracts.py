@@ -8,6 +8,8 @@ EXPECTED_ENTRYPOINTS = [
     "scripts/run_diarization.py",
     "scripts/build_turns.py",
     "scripts/ingest_embeddings.py",
+    "scripts/ingest_many_meetings.py",
+    "scripts/report_ami_meeting_readiness.py",
     "scripts/smoke_rag.py",
     "src/meeting_pipeline/app/app.py",
 ]

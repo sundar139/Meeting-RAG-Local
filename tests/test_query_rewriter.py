@@ -9,10 +9,12 @@ from meeting_pipeline.rag.query_rewriter import QueryRewriter
 class FakeChatClient:
     def __init__(self, response: str) -> None:
         self.response = response
+        self.call_count = 0
         self.last_model: str | None = None
         self.last_messages: list[dict[str, str]] | None = None
 
     def chat(self, model: str, messages: list[dict[str, str]]) -> str:
+        self.call_count += 1
         self.last_model = model
         self.last_messages = messages
         return self.response
@@ -37,6 +39,7 @@ def test_query_rewriter_returns_model_rewrite() -> None:
     assert result.original_query == "What did we commit to?"
     assert result.rewritten_query == "final rewritten query"
     assert result.used_fallback is False
+    assert result.question_relation == "standalone_direct"
     assert client.last_model == "llama-test"
     assert client.last_messages is not None
     assert client.last_messages[1]["content"].count("Earlier they discussed release date") == 1
@@ -50,6 +53,31 @@ def test_query_rewriter_uses_fallback_on_client_error() -> None:
     assert result.original_query == "What changed yesterday?"
     assert result.rewritten_query == "What changed yesterday?"
     assert result.used_fallback is True
+
+
+def test_query_rewriter_preserves_original_when_rewrite_is_lossy() -> None:
+    client = FakeChatClient("Summarize the conversation")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("Give 3 bullet points about SPEAKER_01 decisions in 2024")
+
+    assert result.rewritten_query == "Give 3 bullet points about SPEAKER_01 decisions in 2024"
+    assert result.used_fallback is True
+    assert result.was_lossy is True
+
+
+def test_query_rewriter_detects_meta_question_without_model_call() -> None:
+    client = FakeChatClient("unused")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite(
+        "Which parts of your previous answer are uncertain?",
+        conversation_context=["assistant: Prior answer summary"],
+    )
+
+    assert result.question_relation == "meta_chat_scope"
+    assert result.used_fallback is True
+    assert client.call_count == 0
 
 
 def test_query_rewriter_rejects_empty_question() -> None:

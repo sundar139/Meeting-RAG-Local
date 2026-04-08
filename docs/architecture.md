@@ -21,8 +21,10 @@ Meeting RAG Local transforms AMI meeting assets into searchable, attributable ev
 4. Build canonical speaker turns from aligned + diarized artifacts.
 5. Embed turns and ingest into PostgreSQL + pgvector.
 6. Retrieve evidence by semantic similarity (meeting-scoped).
-7. Generate grounded answer sections from retrieved evidence only.
-8. Evaluate transcript diagnostics and retrieval benchmark metrics.
+7. Apply adaptive retrieval policy by question type (speaker/action-summary/meta/default).
+8. Generate grounded answer sections from retrieved evidence, with format directives and confidence handling.
+9. Reuse recent retrieval/answer state for meta-confidence follow-up questions.
+10. Evaluate transcript diagnostics and retrieval benchmark metrics.
 
 ## 8 GB VRAM Sequencing Guidance
 
@@ -38,4 +40,5 @@ For 8 GB VRAM machines, run heavy stages sequentially and avoid overlapping GPU 
 - Strong typing at boundaries and artifact contracts.
 - Config-driven runtime behavior through environment settings.
 - Clear service interfaces for retrieval and answer generation.
+- Retrieval mode and conversation-state metadata are typed and reusable outside the Streamlit UI.
 - Deterministic testability for non-GPU paths.
