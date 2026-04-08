@@ -12,7 +12,7 @@ from meeting_pipeline.db.repository import ConnectionProtocol, TranscriptChunkRe
 
 try:
     from scripts.ingest_many_meetings import _discover_meeting_ids_from_words_xml
-except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+except ModuleNotFoundError:  # pragma: no cover
     from ingest_many_meetings import _discover_meeting_ids_from_words_xml
 
 LOGGER = logging.getLogger(__name__)

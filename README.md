@@ -1,357 +1,494 @@
 # Meeting RAG Local
 
-Local-first multimodal meeting analysis pipeline for turning meeting audio into searchable transcript evidence and grounded answers, with a demo-ready Streamlit experience.
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](#running-tests-and-quality-checks)
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](#prerequisites)
+[![UV](https://img.shields.io/badge/Package%20Management-uv-5C6BC0)](#getting-started)
+[![Local-First](https://img.shields.io/badge/Deployment-Local--First-2E7D32)](#deployment--production-notes)
 
-## Value Proposition
+Local-first meeting intelligence pipeline that converts meeting audio into searchable transcript evidence and grounded RAG answers. The project is designed for practical local operation with transparent evidence flow, deterministic artifacts, and testable service boundaries.
 
-- Runs fully on local infrastructure (PostgreSQL + pgvector + Ollama + local model stack).
-- Produces traceable outputs from raw data through grounded RAG answers.
-- Keeps retrieval and answer logic separate from the UI for maintainability.
+## Project Overview
 
-## Architecture Overview
+Meeting RAG Local solves a common problem in meeting-heavy teams: extracting reliable answers from long conversations without losing traceability to the original evidence. Instead of relying on opaque summarization alone, the system keeps an explicit path from source artifacts to retrieved chunks to final response sections.
 
-The system is organized as phase-aligned modules:
+Core outcomes:
 
-- Audio wrappers: transcription, alignment, diarization, GPU lifecycle.
-- Data shaping: AMI parsing, attribution, turn building.
-- Persistence + retrieval: PostgreSQL repository layer, pgvector search.
-- RAG services: query rewrite, retrieval orchestration, grounded answer generation.
-- App layer: Streamlit meeting browser + evidence-aware chat.
-- Evaluation layer: transcript diagnostics + retrieval benchmark metrics.
+- Parse and normalize AMI meeting assets.
+- Build canonical speaker turns from alignment and diarization outputs.
+- Embed and index turns in PostgreSQL + pgvector.
+- Retrieve evidence adaptively by question intent.
+- Generate grounded answer sections with explicit insufficient-context handling.
+- Provide a local Streamlit interface for transcript browsing and evidence-aware chat.
 
-See docs/architecture.md for full flow and 8 GB VRAM sequencing notes.
+Tech stack summary:
 
-## Key Capabilities
+- Language and runtime: Python 3.11
+- Dependency management: uv
+- Data store and retrieval: PostgreSQL + pgvector
+- Model integrations: WhisperX, pyannote.audio, Ollama
+- UI: Streamlit
+- Quality gates: pytest, ruff, black, mypy
 
-- Parse AMI word-level XML into typed interim artifacts.
-- Produce aligned transcript and diarization artifacts from meeting audio.
-- Build canonical speaker turns and ingest embeddings into PostgreSQL.
-- Route retrieval adaptively by question type (speaker-specific, decisions/actions, broad summary, confidence/meta).
-- Generate grounded structured answers with format-aware handling (bullets/table/concise) and explicit insufficient-context handling.
-- Browse meetings and run evidence-aware chat in Streamlit.
-- Reuse recent retrieval/answer state for confidence or meta follow-up questions.
-- Batch-ingest multiple meetings and run readiness checks from CLI helpers.
-- Run lightweight, honest transcript/retrieval evaluation from CLI.
+## Motivation and Goals (Why)
 
-## Tech Stack
+### Why local-first operation
 
-- Python 3.11
-- uv for environment/dependency management
-- PostgreSQL + pgvector
-- WhisperX + pyannote for audio processing
-- Ollama for embeddings and chat models
-- Streamlit for local UI
-- pytest, ruff, black, mypy for quality gates
+- Privacy and control: keep data and model calls inside a local environment.
+- Operational predictability: avoid external API latency and quota instability.
+- Debuggability: easier end-to-end introspection of artifacts and retrieval behavior.
 
-## Repository Structure
+### Why explicit artifact stages
 
-- src/meeting_pipeline/: application package
-- scripts/: operational CLIs for each pipeline stage
-- tests/: unit and script-level tests
-- migrations/: SQL schema migrations
-- docs/: architecture/setup/dataset/evaluation docs
-- data/: raw/interim/processed/eval artifacts
+- Every stage creates concrete outputs in data/interim or data/processed.
+- Failures become diagnosable by artifact inspection instead of black-box retries.
+- Evaluation can compare stage outputs directly against fixtures.
 
-## Prerequisites
+### Why adaptive retrieval modes
+
+Different question intents need different retrieval breadth and constraints:
+
+- Speaker-specific questions benefit from scoped retrieval.
+- Decision/action queries need broader evidence than simple factoids.
+- Broad summaries need diversity over larger candidate pools.
+- Confidence/meta follow-ups can reuse prior turn state for speed and consistency.
+
+### Why structured grounded answers
+
+- Structured sections increase readability for humans.
+- Grounded answers reduce unsupported claims by enforcing evidence context.
+- Explicit insufficient-context behavior prevents false confidence.
+
+## Features and Implementation Details (What and How)
+
+### 1) AMI parsing and artifact normalization
+
+What:
+
+- Parses AMI word-level XML files into normalized JSON word artifacts.
+
+Why:
+
+- Establishes a stable baseline for downstream alignment, turn-building, and transcript diagnostics.
+
+How:
+
+- Entry point: scripts/parse_ami_xml.py
+- Contracts: meeting_pipeline.schemas.transcript
+- Outputs: data/interim/<meeting_id>_ground_truth_words.json
+
+### 2) Transcription, alignment, and diarization wrappers
+
+What:
+
+- Runs transcription and alignment against meeting audio, then diarization for speaker segmentation.
+
+Why:
+
+- Combines lexical content with speaker attribution and timing to support trustworthy retrieval chunks.
+
+How:
+
+- Entry points:
+  - scripts/run_transcription.py
+  - scripts/run_diarization.py
+- Wrappers and helpers:
+  - meeting_pipeline.audio.whisperx_runner
+  - meeting_pipeline.audio.alignment
+  - meeting_pipeline.audio.diarization
+  - meeting_pipeline.audio.gpu_utils
+
+### 3) Canonical turn construction
+
+What:
+
+- Merges aligned transcript data and diarization segments into canonical speaker turns.
+
+Why:
+
+- Creates retrieval-ready units with clear speaker and time boundaries.
+
+How:
+
+- Entry point: scripts/build_turns.py
+- Core logic: meeting_pipeline.audio.turn_builder
+- Output: data/processed/<meeting_id>_turns.json
+
+### 4) Embedding ingestion and persistence
+
+What:
+
+- Embeds transcript turns and stores them in PostgreSQL with pgvector support.
+
+Why:
+
+- Enables semantic retrieval scoped by meeting ID and optional speaker constraints.
+
+How:
+
+- Entry points:
+  - scripts/ingest_embeddings.py
+  - scripts/ingest_many_meetings.py
+  - scripts/run_migrations.py
+- Storage and access:
+  - meeting_pipeline.db.connection
+  - meeting_pipeline.db.migrations
+  - meeting_pipeline.db.repository
+  - meeting_pipeline.db.pgvector_search
+
+### 5) RAG orchestration with latency controls
+
+What:
+
+- Handles query rewriting, embedding, adaptive retrieval, and answer synthesis.
+
+Why:
+
+- Preserves answer quality while supporting practical latency for local demos.
+
+How:
+
+- Core modules:
+  - meeting_pipeline.rag.query_rewriter
+  - meeting_pipeline.embeddings.embedder
+  - meeting_pipeline.rag.retriever
+  - meeting_pipeline.rag.answer_generator
+- Performance capabilities:
+  - Stage timing metadata per request
+  - In-memory caches for rewrite/embed/retrieval/answer paths
+  - Optional fast mode with conservative caps and rewrite skipping heuristics
+  - Evidence compaction for prompt size control
+
+### 6) Streamlit app and diagnostics
+
+What:
+
+- Provides meeting browser + evidence-aware chat with diagnostics.
+
+Why:
+
+- Gives operators a practical review interface while preserving retrieval transparency.
+
+How:
+
+- UI modules:
+  - src/meeting_pipeline/app/app.py
+  - src/meeting_pipeline/app/components.py
+- Key UX behaviors:
+  - Meeting selection and transcript filtering
+  - Grounded answer sections and evidence expansion
+  - Debug latency and cache summaries
+  - Fast mode toggle
+
+### 7) Evaluation tooling
+
+What:
+
+- Supports transcript diagnostics and retrieval benchmark diagnostics.
+
+Why:
+
+- Enables measurable quality checks beyond anecdotal UI behavior.
+
+How:
+
+- Entrypoints:
+  - run_eval.py (wrapper)
+  - scripts/run_eval.py (implementation)
+- Core evaluation modules:
+  - meeting_pipeline.eval.transcript_eval
+  - meeting_pipeline.eval.retrieval_eval
+  - meeting_pipeline.eval.metrics
+
+### 8) Operational utilities
+
+What:
+
+- Adds smoke and benchmark scripts for quick verification and latency profiling.
+
+Why:
+
+- Helps validate local readiness and quantify performance tradeoffs.
+
+How:
+
+- scripts/smoke_rag.py
+- scripts/benchmark_rag.py
+- scripts/report_ami_meeting_readiness.py
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[AMI XML + Audio] --> B[Parse XML]
+    B --> C[Ground Truth Words JSON]
+    A --> D[Transcribe + Align]
+    A --> E[Diarize]
+    D --> F[Aligned JSON]
+    E --> G[Diarization JSON]
+    F --> H[Build Canonical Turns]
+    G --> H
+    H --> I[Turns JSON]
+    I --> J[Embed + Ingest PostgreSQL/pgvector]
+    J --> K[Adaptive Retrieval]
+    K --> L[Grounded Answer Generation]
+    L --> M[Streamlit App]
+    I --> N[Transcript Evaluation]
+    K --> O[Retrieval Evaluation]
+```
+
+Request flow (chat):
+
+1. User question enters app layer.
+2. Query rewrite applies context-sensitive normalization.
+3. Query embedding is generated (cache-aware).
+4. Retriever selects adaptive mode and fetches evidence.
+5. Answer generator compacts evidence and synthesizes structured output.
+6. Metadata (timings, cache hits, mode) is returned for diagnostics.
+
+## Challenges and Issues Encountered
+
+### 1) Direct script execution import errors
+
+What went wrong:
+
+- Running path-based commands such as uv run python scripts/ingest_many_meetings.py failed with ModuleNotFoundError for scripts package imports.
+
+Resolution:
+
+- Added import fallbacks in affected scripts so both module-style and path-style execution work reliably.
+
+Learning:
+
+- Operational scripts should tolerate common invocation styles used by developers and CI helpers.
+
+### 2) End-to-end latency variance in local RAG
+
+What went wrong:
+
+- Repeated and broad queries could feel slow due to repeated rewrite/embed/retrieval/answer work.
+
+Resolution:
+
+- Added stage-level timing metadata, in-memory caches, optional fast mode, retrieval caps, and answer evidence compaction.
+
+Learning:
+
+- Local-first systems need explicit latency controls and observability from day one.
+
+### 3) GPU memory pressure on constrained machines
+
+What went wrong:
+
+- Running heavy model stages concurrently can trigger OOM or unstable behavior on 8 GB VRAM environments.
+
+Resolution:
+
+- Kept stage wrappers explicit, documented sequential operation guidance, and preserved CPU fallback options.
+
+Learning:
+
+- Operational sequencing is as important as model quality for reliable local workflows.
+
+### 4) Tooling consistency across contributors
+
+What went wrong:
+
+- Small style and path differences can break lint gates or script assumptions.
+
+Resolution:
+
+- Enforced quality gates (ruff, black, mypy, pytest) and standardized ignore patterns.
+
+Learning:
+
+- Fast, deterministic checks reduce integration churn substantially.
+
+## Getting Started
+
+### Prerequisites
 
 - Python 3.11
 - uv
-- PostgreSQL instance with pgvector available
-- Ollama running locally
-- For audio phases: CUDA-capable environment (recommended) and required model packages
+- PostgreSQL with pgvector available
+- Ollama installed and running locally
+- Optional for full audio pipeline: CUDA-capable environment and compatible model dependencies
 
-## Environment Setup
+### Setup
 
-1. Copy env template.
+1) Clone repository and enter project root.
+
+2) Create environment file.
+
+- Windows PowerShell:
 
 ```powershell
 copy .env.example .env
 ```
 
-or
+- Bash:
 
 ```bash
 cp .env.example .env
 ```
 
-1. Install base development dependencies.
+3) Install dependencies.
+
+- Baseline dev dependencies:
 
 ```bash
 uv sync --group dev
 ```
 
-1. Install runtime extras as needed.
+- Full local pipeline dependencies:
 
 ```bash
 uv sync --group dev --extra data --extra services
+```
+
+- Include GPU extras when required:
+
+```bash
 uv sync --group dev --extra data --extra services --extra gpu
 ```
 
-### Retrieval Policy Environment Variables
-
-The retriever uses mode-specific top-k defaults from `.env`.
-
-- `DEFAULT_FACTOID_TOP_K` (default `5`): fallback for direct factoid questions.
-- `SPEAKER_SPECIFIC_TOP_K` (default `4`): used for speaker-scoped requests (for example `SPEAKER_00`).
-- `ACTION_ITEMS_OR_DECISIONS_TOP_K` (default `8`): used for decisions, owners, and follow-up questions.
-- `BROAD_SUMMARY_TOP_K` (default `14`): used for whole-meeting or high-level summary questions.
-- `META_OR_CONFIDENCE_TOP_K` (default `6`): used for confidence/meta follow-up questions.
-- `BROAD_SUMMARY_MAX_CANDIDATES` (default `28`): broad-summary candidate cap before diversification/down-selection.
-
-Tuning guidance:
-
-- Increase `SPEAKER_SPECIFIC_TOP_K` if speaker follow-ups frequently miss context.
-- Increase `ACTION_ITEMS_OR_DECISIONS_TOP_K` when owners/deadlines are sparse across long meetings.
-- Increase `BROAD_SUMMARY_TOP_K` and `BROAD_SUMMARY_MAX_CANDIDATES` together for richer meeting-wide synthesis.
-- Keep `META_OR_CONFIDENCE_TOP_K` moderate unless confidence audits need broader prior context.
-- Use sidebar override only for ad-hoc inspection; keep stable defaults in `.env` for repeatable demos.
-
-### Performance And Caching Environment Variables
-
-- `ENABLE_RAG_CACHING` (default `true`): master toggle for in-memory rewrite/embed/retrieval/answer caches.
-- `QUERY_REWRITE_CACHE_SIZE` (default `256`): max cached rewrite keys.
-- `QUERY_EMBEDDING_CACHE_SIZE` (default `512`): max cached query embeddings.
-- `RETRIEVAL_BUNDLE_CACHE_SIZE` (default `256`): max cached retrieval bundles.
-- `ANSWER_CACHE_SIZE` (default `256`): max cached grounded answers.
-- `ANSWER_MAX_EVIDENCE_CHUNKS` (default `12`): max evidence chunks included in answer prompt context.
-- `ANSWER_MAX_EVIDENCE_CHARS` (default `12000`): cap for total prompt evidence characters.
-- `ANSWER_MAX_CHUNK_CHARS` (default `600`): per-chunk evidence truncation cap.
-
-Fast mode environment toggles:
-
-- `ENABLE_FAST_MODE` (default `false`): enables conservative lower-latency path.
-- `FAST_MODE_SKIP_QUERY_REWRITE` (default `true`): skips model rewrite for clearly standalone prompts.
-- `FAST_MODE_POLICY_TOP_K_CAP` (default `6`): policy top-k cap used when fast mode is enabled.
-- `FAST_MODE_ANSWER_MAX_EVIDENCE_CHUNKS` (default `8`): prompt evidence chunk cap in fast mode.
-- `FAST_MODE_ANSWER_MAX_EVIDENCE_CHARS` (default `7500`): total evidence char cap in fast mode.
-- `FAST_MODE_ANSWER_MAX_CHUNK_CHARS` (default `420`): per-chunk char cap in fast mode.
-
-## Database Setup
-
-1. Create database.
+4) Initialize database.
 
 ```bash
 createdb meeting_pipeline
-```
-
-1. Run migrations.
-
-```bash
 uv run python scripts/run_migrations.py
 ```
 
-## Dataset Setup
-
-- Place AMI assets under data/raw/ami/.
-- Expected XML pattern: <meeting_id>.<speaker_id>.words.xml.
-- Example audio file used in commands below: data/raw/ami/ES2002a.Mix-Headset.wav.
-
-## End-to-End Pipeline Workflow
-
-Canonical order:
-
-1. Migrate DB
+5) Prepare Ollama models.
 
 ```bash
-uv run python scripts/run_migrations.py
+ollama serve
+ollama pull nomic-embed-text-v2-moe
+ollama pull llama3.2:3b-instruct
 ```
 
-1. Parse dataset (AMI XML)
+### End-to-end pipeline example
 
 ```bash
 uv run python scripts/parse_ami_xml.py --meeting-id ES2002a --input-dir data/raw/ami --output-dir data/interim
-```
-
-1. Transcribe + align
-
-```bash
 uv run python scripts/run_transcription.py --audio-path data/raw/ami/ES2002a.Mix-Headset.wav --meeting-id ES2002a --output-dir data/interim
-```
-
-1. Diarize
-
-```bash
 uv run python scripts/run_diarization.py --audio-path data/raw/ami/ES2002a.Mix-Headset.wav --meeting-id ES2002a --output-dir data/interim
-```
-
-1. Build canonical turns
-
-```bash
 uv run python scripts/build_turns.py --meeting-id ES2002a --aligned-path data/interim/ES2002a_aligned.json --diarization-path data/interim/ES2002a_diarization.json --output-dir data/processed
-```
-
-1. Ingest embeddings
-
-```bash
 uv run python scripts/ingest_embeddings.py --meeting-id ES2002a --turns-path data/processed/ES2002a_turns.json --replace-existing --batch-size 16
+uv run streamlit run src/meeting_pipeline/app/app.py
 ```
 
-Optional multi-meeting ingestion:
+### Useful operational commands
+
+- Batch ingestion:
 
 ```bash
 uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16
 ```
 
-Optional readiness report:
+- Readiness report:
 
 ```bash
 uv run python scripts/report_ami_meeting_readiness.py --raw-ami-dir data/raw/ami --interim-dir data/interim --processed-dir data/processed --only-missing
 ```
 
-1. Optional smoke RAG run
-
-```bash
-uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5
-```
-
-1. Launch app
-
-```bash
-uv run streamlit run src/meeting_pipeline/app/app.py
-```
-
-## Evaluation Workflow
-
-Transcript diagnostics only:
-
-```bash
-uv run python run_eval.py --transcript-reference-path data/interim/ES2002a_ground_truth_words.json --transcript-prediction-path data/processed/ES2002a_turns.json
-```
-
-Retrieval benchmark with precomputed predictions:
-
-```bash
-uv run python run_eval.py --retrieval-benchmark-path data/eval/retrieval_benchmark.json --retrieval-predictions-path data/eval/retrieval_predictions.json --retrieval-top-k 5
-```
-
-Retrieval benchmark with live retrieval generation:
-
-```bash
-uv run python run_eval.py --retrieval-benchmark-path data/eval/retrieval_benchmark.json --retrieval-top-k 5 --live-retrieval
-```
-
-Write evaluation output:
-
-```bash
-uv run python run_eval.py --transcript-reference-path data/interim/ES2002a_ground_truth_words.json --transcript-prediction-path data/processed/ES2002a_turns.json --output-path data/eval/eval_summary.json
-```
-
-## Launching the Streamlit App
-
-```bash
-uv run streamlit run src/meeting_pipeline/app/app.py
-```
-
-App behavior:
-
-- Sidebar meeting selection from ingested PostgreSQL data.
-- Sidebar fast mode toggle for demo-oriented latency optimization.
-- Optional adaptive top-k override for retrieval policy debugging.
-- Stage progress captions during each question cycle (retrieve -> answer).
-- Transcript browser with speaker filter and text filter.
-- Grounded chat panel with rewritten query, structured answer, and evidence expansion.
-- Per-answer diagnostics badges beside each assistant response:
-  - mode badge (`default_factoid`, `broad_summary`, `speaker_specific`, `action_items_or_decisions`, `meta_or_confidence`)
-  - top-k used
-  - context source (`Fresh` or `Cached`)
-  - confidence status (`Grounded` or `Low`)
-- Optional latency summary in debug mode (`rewrite`, `embed`, `retrieve`, `answer`, `total`).
-- Optional cache summary in debug mode (`rewrite/embed/retrieve/answer` hit vs miss).
-- Meeting insights (chunk count, speakers, transcript span, recent questions).
-
-Debug mode notes:
-
-- Enable `Show technical errors` in the sidebar to expose exception traces and latency summaries.
-- Debug mode bypasses in-memory request caches so stage timing reflects fresh work.
-- Use low-confidence badges plus evidence expanders to diagnose insufficient-evidence responses quickly.
-- Keep debug mode off during normal demos for a cleaner UI.
-
-Timing metadata interpretation:
-
-- `query_rewrite`: rewrite stage latency.
-- `query_embedding`: embedding stage latency.
-- `postgres_retrieval`: pgvector retrieval latency.
-- `answer_generation`: answer synthesis latency.
-- `total_request`: end-to-end request latency.
-
-## Demo Script (Recommended)
-
-1. Start PostgreSQL and Ollama.
-2. Confirm models:
-   - ollama pull nomic-embed-text-v2-moe
-   - ollama pull llama3.2:3b-instruct
-3. Run steps 1-6 from End-to-End Workflow on ES2002a.
-4. Run smoke_rag command once to validate retrieval/answer path.
-5. Launch Streamlit and demo:
-   - meeting selection
-   - transcript filtering
-   - grounded Q&A with evidence expansion
-
-Optional smoke diagnostics command:
+- Smoke run:
 
 ```bash
 uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --debug --preview-evidence
 ```
 
-This prints retrieved evidence first (debug preview), then the final answer payload including latency timings.
-
-Fast-mode smoke example:
-
-```bash
-uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --fast-mode
-```
-
-No-cache smoke example:
-
-```bash
-uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --no-cache
-```
-
-## Benchmarking Latency
-
-Benchmark helper:
-
-```bash
-uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --question "What did SPEAKER_00 discuss?" --runs 3
-```
-
-Fast-mode benchmark:
+- Benchmark:
 
 ```bash
 uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --runs 5 --fast-mode
 ```
 
-Fresh-work benchmark (cache disabled):
+## Running Tests and Quality Checks
+
+Run full gates:
 
 ```bash
-uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --runs 5 --no-cache
+uv run ruff check .
+uv run black --check .
+uv run mypy src
+uv run pytest
 ```
 
-Benchmark output includes average total latency, per-stage averages, and cache hit rates.
+Focused script regression checks:
 
-## Performance Tradeoffs
+```bash
+uv run pytest tests/test_ingest_many_meetings_script.py tests/test_report_ami_meeting_readiness_script.py -q
+```
 
-- Default mode prioritizes safer retrieval breadth and fuller prompt context.
-- Fast mode reduces latency by capping policy top-k, tightening evidence compaction, and optionally skipping rewrite for clearly standalone questions.
-- In-memory caches improve repeated-question responsiveness but are process-local and reset when the app process restarts.
+## Deployment / Production Notes
 
-## Troubleshooting
+Current deployment posture:
 
-- DB connection errors:
-  - verify POSTGRES_* values in .env
-  - verify server reachable and migrations applied
-- Ollama unavailable/model-not-found:
-  - start ollama serve
-  - pull OLLAMA_MODEL and OLLAMA_CHAT_MODEL
-- Empty app state:
-  - ensure at least one meeting is ingested via ingest_embeddings
-- GPU phase failures:
-  - validate CUDA/driver environment
-  - run uv run python scripts/check_gpu.py
+- Local-first single-operator deployment is the primary target.
+- PostgreSQL and Ollama are expected to run in the same trusted environment.
 
-## Limitations and Future Improvements
+Production considerations:
 
-- Retrieval evaluation quality depends on benchmark fixture quality and coverage.
-- Transcript diagnostics are lightweight and not a full ASR benchmark suite.
-- Live retrieval evaluation depends on local DB/Ollama availability.
-- UI is intentionally minimal and optimized for local demo reliability rather than multi-user deployment.
+- Use managed secrets instead of plaintext environment files.
+- Keep model/runtime versions pinned across environments.
+- Separate long-running GPU stages from interactive UI serving.
+- Monitor retrieval latency and cache effectiveness to tune fast mode and top-k caps.
+- Treat data/interim and data/processed as regenerable artifacts, not source-of-truth.
+
+## Project Structure
+
+```text
+.
+├── src/meeting_pipeline/
+│   ├── app/               # Streamlit orchestration and rendering helpers
+│   ├── audio/             # Transcription, alignment, diarization, attribution, GPU utilities
+│   ├── db/                # DB connection, migrations, repository, pgvector search
+│   ├── embeddings/        # Ollama client and embedding service
+│   ├── eval/              # Transcript and retrieval evaluation logic
+│   ├── rag/               # Query rewrite, retrieval orchestration, answer generation
+│   ├── schemas/           # Typed artifact contracts
+│   ├── config.py          # Typed runtime settings
+│   └── cache_utils.py     # In-memory LRU cache utility
+├── scripts/               # Operational CLI entry points
+├── tests/                 # Unit and script-level tests
+├── migrations/            # SQL migration files
+├── docs/                  # Architecture, setup, dataset, evaluation, AMI download notes
+├── data/                  # Raw/interim/processed/eval artifacts
+├── run_eval.py            # Root convenience wrapper for evaluation CLI
+└── pyproject.toml         # Project metadata and tool configuration
+```
+
+Primary feature locations:
+
+- RAG orchestration: src/meeting_pipeline/rag
+- Retrieval database operations: src/meeting_pipeline/db
+- End-user app: src/meeting_pipeline/app
+- Pipeline operations: scripts
+
+## Roadmap / Future Improvements
+
+- Add optional containerized local deployment profile.
+- Expand evaluation fixtures for broader retrieval scenarios.
+- Add integration tests for end-to-end artifact generation on sample meetings.
+- Add structured telemetry export for latency and cache metrics.
+- Improve multi-meeting incremental ingestion observability.
+
+## Refactoring Summary
+
+This repository cleanup included:
+
+- Comment hygiene:
+  - Removed low-value inline instruction text and retained only high-value comments for non-obvious behavior.
+  - Kept concise exception comments where coverage/tooling behavior needed context.
+
+- Git hygiene:
+  - Reorganized and expanded root .gitignore by category.
+  - Added ignore coverage for OS/editor artifacts, caches, logs, build outputs, local env files, and common cross-language outputs.
+
+- Structure hygiene:
+  - Moved AMI download guidance from scripts/download_ami.md to docs/download-ami.md.
+  - Removed tracked local editor settings from .vscode.
+
+- Documentation rewrite:
+  - Rewrote README to include implementation-grounded architecture, rationale, feature internals, setup, validation, deployment notes, and roadmap.
+  - Added badges and standardized command examples.

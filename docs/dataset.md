@@ -1,5 +1,7 @@
 # Dataset Notes
 
+AMI acquisition steps are documented in `docs/download-ami.md`.
+
 ## Source Layout
 
 Place AMI assets under `data/raw/ami/`.

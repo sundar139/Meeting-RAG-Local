@@ -11,7 +11,7 @@ from meeting_pipeline.db.repository import ConnectionProtocol, TranscriptChunkRe
 
 try:
     from scripts.ingest_embeddings import ingest_embeddings
-except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+except ModuleNotFoundError:  # pragma: no cover
     from ingest_embeddings import ingest_embeddings
 
 LOGGER = logging.getLogger(__name__)
