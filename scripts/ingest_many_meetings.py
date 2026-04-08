@@ -92,7 +92,11 @@ def ingest_many_meetings(
                     LOGGER.info("Skipping %s: chunks already ingested", meeting_id)
                     continue
             except Exception as exc:
-                LOGGER.warning("DB existing-check failed for %s; continuing. reason=%s", meeting_id, exc)
+                LOGGER.warning(
+                    "DB existing-check failed for %s; continuing. reason=%s",
+                    meeting_id,
+                    exc,
+                )
 
         try:
             ingest_embeddings(

@@ -118,7 +118,7 @@ def run_diarization(audio_path: Path | str, config: DiarizationConfig) -> list[D
             diarization_kwargs["max_speakers"] = config.max_speakers
 
         LOGGER.info("Running diarization audio=%s", audio_file)
-        diarization_output = pipeline(str(audio_file), **diarization_kwargs) # type: ignore
+        diarization_output = pipeline(str(audio_file), **diarization_kwargs)  # type: ignore
 
         segments: list[DiarizationSegment] = []
         for turn, _, speaker_label in diarization_output.itertracks(yield_label=True):
