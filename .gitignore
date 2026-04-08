@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+.env
+.DS_Store
+.streamlit/
+*.log
+
+# Local pipeline artifacts
+data/raw/ami/*.wav
+data/raw/ami/*.xml
+data/interim/*.json
+data/processed/*.json
+data/eval/*.json
+data/eval/*.md
+
+# Keep tracked placeholders
+!data/**/.gitkeep

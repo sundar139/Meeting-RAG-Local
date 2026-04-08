@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meeting-pipeline"
+version = "0.1.0"
+description = "Local-first multimodal meeting analysis pipeline foundation."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "pydantic>=2",
+  "pydantic-settings>=2.4",
+  "python-dotenv>=1.0",
+  "rich>=13.7",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "torch==2.4.1+cu121",
+  "torchvision==0.19.1+cu121",
+  "torchaudio==2.4.1+cu121",
+  "whisperx",
+  "pyannote.audio",
+  "huggingface-hub<1",
+  "matplotlib",
+  "setuptools<81",
+]
+services = [
+  "psycopg2-binary",
+  "streamlit",
+  "ollama",
+]
+data = [
+  "numpy",
+  "pandas",
+  "soundfile",
+  "librosa",
+]
+
+[dependency-groups]
+dev = [
+  "ruff",
+  "black",
+  "pytest",
+  "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meeting_pipeline"]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008", "UP017"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = false
+ignore_missing_imports = true
