@@ -176,6 +176,34 @@ def _build_assistant_message(answer: GroundedAnswerResult) -> str:
     return "Answer generated from retrieved evidence."
 
 
+def _format_rewritten_query_caption(
+    *,
+    question: str,
+    rewritten_query: str,
+    service_metadata: dict[str, object] | None,
+) -> str:
+    if service_metadata is not None:
+        rewrite_meta = service_metadata.get("rewrite")
+        if isinstance(rewrite_meta, dict) and rewrite_meta.get("used_fallback") is True:
+            fallback_reason = rewrite_meta.get("fallback_reason")
+            reason_label = (
+                str(fallback_reason).replace("_", " ")
+                if isinstance(fallback_reason, str) and fallback_reason
+                else "safety fallback"
+            )
+            return f"Rewritten query (fallback to original; {reason_label}): {question}"
+    return f"Rewritten query: {rewritten_query}"
+
+
+def _meeting_availability_hint(available_meetings: Sequence[str]) -> str | None:
+    if len(available_meetings) != 1:
+        return None
+    return (
+        "Only one ingested meeting is available. For multi-meeting demos, run readiness "
+        "checks and batch ingestion, then refresh meeting metadata."
+    )
+
+
 def _user_facing_error_message(error: Exception) -> str:
     if isinstance(error, DatabaseConnectionError):
         return (
@@ -301,6 +329,14 @@ def _run_rag_services(
     service_metadata["fast_mode"] = bool(
         service_metadata.get("fast_mode") or bundle.service_metadata.get("fast_mode")
     )
+    bundle_routing = bundle.service_metadata.get("routing")
+    if isinstance(bundle_routing, dict):
+        service_metadata["routing"] = bundle_routing
+
+    bundle_rewrite = bundle.service_metadata.get("rewrite")
+    if isinstance(bundle_rewrite, dict):
+        service_metadata["rewrite"] = bundle_rewrite
+
     answer = replace(answer, service_metadata=service_metadata)
 
     if progress_reporter is not None:
@@ -445,6 +481,10 @@ def main() -> None:
         )
         return
 
+    meeting_hint = _meeting_availability_hint(available_meetings)
+    if meeting_hint:
+        st.sidebar.info(meeting_hint)
+
     current = _select_default_meeting(state["selected_meeting"], available_meetings)
     default_index = available_meetings.index(current) if current else 0
     selected_meeting = st.sidebar.selectbox(
@@ -521,7 +561,13 @@ def main() -> None:
                     service_metadata=turn_service_metadata,
                     show_latency=debug_mode,
                 )
-                st.caption(f"Rewritten query: {rewritten_query}")
+                st.caption(
+                    _format_rewritten_query_caption(
+                        question=question,
+                        rewritten_query=rewritten_query,
+                        service_metadata=turn_service_metadata,
+                    )
+                )
                 components.render_answer_sections(answer)
                 with st.expander("Evidence"):
                     components.render_evidence_panel(evidence)
@@ -614,7 +660,13 @@ def main() -> None:
                     service_metadata=answer.service_metadata,
                     show_latency=debug_mode,
                 )
-                st.caption(f"Rewritten query: {bundle.rewritten_query}")
+                st.caption(
+                    _format_rewritten_query_caption(
+                        question=question,
+                        rewritten_query=bundle.rewritten_query,
+                        service_metadata=answer.service_metadata,
+                    )
+                )
                 components.render_answer_sections(answer)
                 with st.expander("Evidence", expanded=answer.insufficient_context):
                     components.render_evidence_panel(bundle.results)

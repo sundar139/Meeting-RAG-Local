@@ -12,6 +12,7 @@ from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClient, OllamaClientError
 from meeting_pipeline.rag.models import (
     ConversationState,
+    ConversationTurnState,
     FormatDirectives,
     GroundedAnswerResult,
     RetrievalMode,
@@ -424,6 +425,60 @@ def _render_recent_state_block(recent_state: ConversationState | None) -> str:
     )
 
 
+def _is_conversation_wide_meta_question(question: str) -> bool:
+    lower_question = question.lower()
+    return any(
+        phrase in lower_question
+        for phrase in (
+            "these answers",
+            "recent answers",
+            "across prior answers",
+            "broader recent conversation",
+            "conversation so far",
+            "overall confidence",
+        )
+    )
+
+
+def _summarize_recent_turn_confidence(
+    recent_turns: Sequence[ConversationTurnState],
+) -> tuple[str, str, int]:
+    if not recent_turns:
+        return (
+            "No recent turn state was available for confidence review.",
+            "No low-confidence turns were available in recent state.",
+            0,
+        )
+
+    reviewed_turns = recent_turns[-6:]
+    low_confidence_turns = [turn for turn in reviewed_turns if turn.insufficient_context]
+
+    mode_counts: dict[str, int] = {}
+    for turn in reviewed_turns:
+        mode_counts[turn.retrieval_mode] = mode_counts.get(turn.retrieval_mode, 0) + 1
+
+    mode_summary = ", ".join(
+        f"{mode}:{count}" for mode, count in sorted(mode_counts.items(), key=lambda item: item[0])
+    )
+    key_points = (
+        f"Reviewed {len(reviewed_turns)} recent turns. "
+        f"Low-confidence turns: {len(low_confidence_turns)}. "
+        f"Routing mix: {mode_summary or 'none'}."
+    )
+
+    if not low_confidence_turns:
+        return key_points, "No low-confidence turns were flagged in the recent conversation.", 0
+
+    low_confidence_questions = "; ".join(
+        turn.question for turn in low_confidence_turns[:3] if turn.question.strip()
+    )
+    uncertainty = (
+        "Low-confidence recent questions: "
+        f"{low_confidence_questions or 'details unavailable from recent state.'}"
+    )
+    return key_points, uncertainty, len(low_confidence_turns)
+
+
 def _build_meta_answer_from_state(
     *,
     meeting_id: str,
@@ -433,7 +488,8 @@ def _build_meta_answer_from_state(
 ) -> GroundedAnswerResult:
     latest_answer = recent_state.latest_answer
     latest_bundle = recent_state.latest_bundle
-    if latest_answer is None:
+    recent_turns = recent_state.recent_turns or []
+    if latest_answer is None and not recent_turns:
         sections = _build_insufficient_sections("meta_or_confidence")
         raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
         return GroundedAnswerResult(
@@ -456,23 +512,83 @@ def _build_meta_answer_from_state(
             for chunk in preview_chunks
         )
 
-    uncertainty_text = latest_answer.sections.get(
-        "Uncertainties / Missing Evidence",
-        "Uncertainty details were not captured in the prior turn.",
+    uncertainty_text = (
+        latest_answer.sections.get(
+            "Uncertainties / Missing Evidence",
+            "Uncertainty details were not captured in the prior turn.",
+        )
+        if latest_answer is not None
+        else "No latest answer uncertainty details were available."
     )
+
+    if _is_conversation_wide_meta_question(question):
+        key_points, recent_uncertainty, low_confidence_count = _summarize_recent_turn_confidence(
+            recent_turns
+        )
+        sections = {
+            "Summary": (
+                "Confidence review across the recent conversation state. "
+                "No new retrieval evidence was added for this meta question."
+            ),
+            "Key Points": key_points,
+            "Decisions": (
+                latest_answer.sections.get(
+                    "Decisions",
+                    "No latest decision details were available.",
+                )
+                if latest_answer is not None
+                else "No latest decision details were available."
+            ),
+            "Action Items": (
+                latest_answer.sections.get(
+                    "Action Items",
+                    "No latest action-item details were available.",
+                )
+                if latest_answer is not None
+                else "No latest action-item details were available."
+            ),
+            "Uncertainties / Missing Evidence": (
+                f"{recent_uncertainty} Latest-turn uncertainty notes: {uncertainty_text}"
+            ),
+        }
+        raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
+        return GroundedAnswerResult(
+            meeting_id=meeting_id,
+            question=question,
+            rewritten_query=rewritten_query,
+            sections=sections,
+            raw_answer=raw_answer,
+            insufficient_context=(
+                low_confidence_count > 0
+                or bool(latest_answer.insufficient_context if latest_answer is not None else False)
+            ),
+        )
+
+    latest_summary = (
+        latest_answer.sections.get("Summary", "Not available.")
+        if latest_answer
+        else "Not available."
+    )
+
     sections = {
         "Summary": (
             "Confidence review based on the most recent answer context. "
             "No new retrieval evidence was added for this meta question."
         ),
-        "Key Points": (
-            f"Prior answer summary: {latest_answer.sections.get('Summary', 'Not available.')}"
+        "Key Points": f"Prior answer summary: {latest_summary}",
+        "Decisions": (
+            latest_answer.sections.get(
+                "Decisions", "No prior decision details available for confidence review."
+            )
+            if latest_answer is not None
+            else "No prior decision details available for confidence review."
         ),
-        "Decisions": latest_answer.sections.get(
-            "Decisions", "No prior decision details available for confidence review."
-        ),
-        "Action Items": latest_answer.sections.get(
-            "Action Items", "No prior action-item details available for confidence review."
+        "Action Items": (
+            latest_answer.sections.get(
+                "Action Items", "No prior action-item details available for confidence review."
+            )
+            if latest_answer is not None
+            else "No prior action-item details available for confidence review."
         ),
         "Uncertainties / Missing Evidence": (
             f"Prior uncertainty notes: {uncertainty_text} Evidence preview: {evidence_preview}"
@@ -485,7 +601,7 @@ def _build_meta_answer_from_state(
         rewritten_query=rewritten_query,
         sections=sections,
         raw_answer=raw_answer,
-        insufficient_context=latest_answer.insufficient_context,
+        insufficient_context=bool(latest_answer.insufficient_context if latest_answer else False),
     )
 
 

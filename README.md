@@ -158,6 +158,22 @@ How:
   - Optional fast mode with conservative caps and rewrite skipping heuristics
   - Evidence compaction for prompt size control
 
+Rewriter safety behavior:
+
+- Rewritten-query output is sanitized and validated before use.
+- Reasoning-style output, boxed/final-answer wrappers, and verbose explanatory output are rejected.
+- When rewrite quality is unsafe or poor, the system falls back to the original user question.
+
+Meta-question support:
+
+- Confidence/introspective questions route to `meta_or_confidence` instead of normal topical retrieval.
+- Meta handling can review the latest turn or summarize recent conversation confidence state.
+
+Broad-summary support:
+
+- Whole-meeting and broad-topic questions route to `broad_summary` retrieval mode.
+- Broad-summary retrieval uses wider candidate retrieval plus speaker/time diversification.
+
 ### 6) Streamlit app and diagnostics
 
 What:
@@ -363,7 +379,7 @@ uv run python scripts/run_migrations.py
 ```bash
 ollama serve
 ollama pull nomic-embed-text-v2-moe
-ollama pull llama3.2:3b-instruct
+ollama pull qwen3:4b
 ```
 
 ### End-to-end pipeline example
@@ -385,6 +401,12 @@ uv run streamlit run src/meeting_pipeline/app/app.py
 uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16
 ```
 
+- Multi-meeting discovery plan:
+
+```bash
+uv run python scripts/ingest_many_meetings.py discover --raw-ami-dir data/raw/ami --turns-dir data/processed --discovery-source both
+```
+
 - Readiness report:
 
 ```bash
@@ -401,6 +423,43 @@ uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisio
 
 ```bash
 uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --runs 5 --fast-mode
+```
+
+### Exact multi-meeting workflow
+
+1. Run readiness check to see missing artifacts:
+
+```bash
+uv run python scripts/report_ami_meeting_readiness.py --raw-ami-dir data/raw/ami --interim-dir data/interim --processed-dir data/processed --only-missing
+```
+
+2. Process meetings (parse -> transcription/alignment -> diarization -> turns):
+
+```bash
+uv run python scripts/parse_ami_xml.py --meeting-id EN2002a --input-dir data/raw/ami --output-dir data/interim
+uv run python scripts/run_transcription.py --audio-path data/raw/ami/EN2002a.Mix-Headset.wav --meeting-id EN2002a --output-dir data/interim
+uv run python scripts/run_diarization.py --audio-path data/raw/ami/EN2002a.Mix-Headset.wav --meeting-id EN2002a --output-dir data/interim
+uv run python scripts/build_turns.py --meeting-id EN2002a --aligned-path data/interim/EN2002a_aligned.json --diarization-path data/interim/EN2002a_diarization.json --output-dir data/processed
+```
+
+Repeat step 2 for each meeting ID you want to ingest.
+
+3. Discover candidate meetings and readiness:
+
+```bash
+uv run python scripts/ingest_many_meetings.py discover --raw-ami-dir data/raw/ami --turns-dir data/processed --discovery-source both
+```
+
+4. Ingest many processed meetings safely:
+
+```bash
+uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --discovery-source both
+```
+
+5. Launch app and refresh metadata if needed:
+
+```bash
+uv run streamlit run src/meeting_pipeline/app/app.py
 ```
 
 ## Running Tests and Quality Checks

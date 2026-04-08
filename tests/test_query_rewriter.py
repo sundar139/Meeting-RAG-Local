@@ -46,6 +46,26 @@ def test_query_rewriter_returns_model_rewrite() -> None:
     assert client.last_messages[1]["content"].count("Earlier they discussed release date") == 1
 
 
+def test_query_rewriter_sanitizes_prefixed_summary_rewrite() -> None:
+    client = FakeChatClient("Rewritten query: What were the main topics discussed in this meeting?")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("What were the main topics discussed?")
+
+    assert result.used_fallback is False
+    assert result.rewritten_query == "What were the main topics discussed in this meeting?"
+
+
+def test_query_rewriter_preserves_bullet_instruction_in_clean_rewrite() -> None:
+    client = FakeChatClient("Summarize the meeting in 5 bullet points using transcript evidence")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("Summarize the meeting in 5 bullet points")
+
+    assert result.used_fallback is False
+    assert "5 bullet points" in result.rewritten_query.lower()
+
+
 def test_query_rewriter_uses_fallback_on_client_error() -> None:
     rewriter = QueryRewriter(client=RaisingChatClient(), model_name="llama-test")
 
@@ -81,6 +101,20 @@ def test_query_rewriter_detects_meta_question_without_model_call() -> None:
     assert client.call_count == 0
 
 
+def test_query_rewriter_detects_confidence_meta_question_without_model_call() -> None:
+    client = FakeChatClient("unused")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite(
+        "What parts of my question cannot be answered confidently from the retrieved evidence?"
+    )
+
+    assert result.question_relation == "meta_chat_scope"
+    assert result.used_fallback is True
+    assert result.fallback_reason == "meta_question"
+    assert client.call_count == 0
+
+
 def test_query_rewriter_rejects_empty_question() -> None:
     rewriter = QueryRewriter(client=FakeChatClient("ok"), model_name="llama-test")
 
@@ -99,6 +133,29 @@ def test_query_rewriter_caches_identical_inputs() -> None:
     assert first.used_cache is False
     assert second.used_cache is True
     assert client.call_count == 1
+
+
+def test_query_rewriter_rejects_reasoning_leakage_and_falls_back() -> None:
+    client = FakeChatClient(
+        "Let's think step by step. Final answer: What were the main meeting topics?"
+    )
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("What were the main meeting topics?")
+
+    assert result.used_fallback is True
+    assert result.fallback_reason == "rewrite_output_rejected"
+    assert result.rewritten_query == "What were the main meeting topics?"
+
+
+def test_query_rewriter_rejects_boxed_final_answer_wrapper() -> None:
+    client = FakeChatClient("Final answer: \\boxed{Summarize the meeting in 5 bullet points}")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("Summarize the meeting in 5 bullet points")
+
+    assert result.used_fallback is True
+    assert result.rewritten_query == "Summarize the meeting in 5 bullet points"
 
 
 def test_query_rewriter_fast_mode_can_skip_model_call() -> None:

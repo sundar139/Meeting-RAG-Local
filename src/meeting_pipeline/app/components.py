@@ -162,6 +162,30 @@ def _format_cache_summary(service_metadata: Mapping[str, object] | None) -> str 
     return " | ".join(parts) if parts else None
 
 
+def _format_routing_summary(service_metadata: Mapping[str, object] | None) -> str | None:
+    if service_metadata is None:
+        return None
+
+    routing = service_metadata.get("routing")
+    if not isinstance(routing, dict):
+        return None
+
+    parts: list[str] = []
+    retrieval_mode = routing.get("retrieval_mode")
+    if isinstance(retrieval_mode, str) and retrieval_mode.strip():
+        parts.append(f"mode {retrieval_mode}")
+
+    question_relation = routing.get("question_relation")
+    if isinstance(question_relation, str) and question_relation.strip():
+        parts.append(f"relation {question_relation}")
+
+    meta_scope = routing.get("meta_scope")
+    if isinstance(meta_scope, str) and meta_scope.strip():
+        parts.append(f"meta_scope {meta_scope}")
+
+    return " | ".join(parts) if parts else None
+
+
 def _badge(label: str, value: str, *, tone: str = "neutral") -> str:
     color_map = {
         "neutral": ("#6B7280", "#F9FAFB", "#374151"),
@@ -201,6 +225,18 @@ def render_response_diagnostics(
     st.markdown("<div>" + "".join(badges) + "</div>", unsafe_allow_html=True)
 
     if show_latency:
+        routing_summary = _format_routing_summary(service_metadata)
+        if routing_summary:
+            st.markdown(
+                (
+                    '<div style="font-size:0.82rem;color:#6B7280;margin-top:-0.1rem;'
+                    'margin-bottom:0.35rem;">'
+                    f"Routing: {routing_summary}"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
         latency_summary = _format_latency_summary(service_metadata)
         if latency_summary:
             st.markdown(
@@ -231,10 +267,10 @@ def render_answer_sections(answer: GroundedAnswerResult) -> None:
 
     if answer.insufficient_context:
         render_warning(
-            "This answer is low confidence because supporting evidence was limited.",
+            "Low confidence: supporting evidence is limited for this answer.",
             hint=(
-                "Try a broader question, request a whole-meeting summary, "
-                "or increase adaptive top-k from the sidebar."
+                "Try a broader question, ask for a whole-meeting summary, "
+                "or increase adaptive top-k."
             ),
         )
 

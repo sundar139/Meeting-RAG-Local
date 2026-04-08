@@ -7,6 +7,7 @@ from meeting_pipeline.embeddings.ollama_client import OllamaClientError
 from meeting_pipeline.rag.answer_generator import AnswerGenerator
 from meeting_pipeline.rag.models import (
     ConversationState,
+    ConversationTurnState,
     GroundedAnswerResult,
     RetrievalBundle,
     RetrievedChunk,
@@ -273,3 +274,61 @@ def test_answer_generator_fast_mode_forces_short_summary_default() -> None:
 
     assert "Sentence three" not in result.sections["Summary"]
     assert result.service_metadata.get("fast_mode") is True
+
+
+def test_answer_generator_builds_recent_conversation_meta_review() -> None:
+    client = FakeChatClient('{"Summary":"unused"}')
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    recent_state = ConversationState(
+        recent_turns=[
+            ConversationTurnState(
+                question="What decisions were made?",
+                rewritten_query="meeting decisions",
+                retrieval_mode="broad_summary",
+                answer_summary="Decision summary.",
+                insufficient_context=False,
+            ),
+            ConversationTurnState(
+                question="What risks were raised?",
+                rewritten_query="meeting risks",
+                retrieval_mode="broad_summary",
+                answer_summary="Risk summary.",
+                insufficient_context=True,
+            ),
+        ]
+    )
+
+    result = generator.generate(
+        user_question="Which of these answers are low confidence across the conversation so far?",
+        meeting_id="m1",
+        rewritten_query="meta confidence review",
+        retrieved_evidence=[],
+        retrieval_mode="meta_or_confidence",
+        recent_state=recent_state,
+    )
+
+    assert "recent conversation state" in result.sections["Summary"]
+    assert "Low-confidence recent questions" in result.sections["Uncertainties / Missing Evidence"]
+    assert result.insufficient_context is True
+    assert client.call_count == 0
+
+
+def test_answer_generator_broad_summary_reports_insufficient_evidence_cleanly() -> None:
+    client = FakeChatClient('{"Summary":"unused"}')
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    result = generator.generate(
+        user_question="Summarize the meeting in 5 bullet points",
+        meeting_id="m1",
+        rewritten_query="summarize meeting in 5 bullet points",
+        retrieved_evidence=[],
+        retrieval_mode="broad_summary",
+    )
+
+    assert result.insufficient_context is True
+    assert result.sections["Summary"].count("- ") == 5
+    assert (
+        "Current retrieval mode: broad_summary"
+        in result.sections["Uncertainties / Missing Evidence"]
+    )

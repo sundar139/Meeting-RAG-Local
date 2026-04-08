@@ -25,6 +25,82 @@ _SPEAKER_TOKEN_PATTERN = re.compile(r"\bSPEAKER_\d+\b", re.IGNORECASE)
 RetrievalCacheKey = tuple[str, str, int, RetrievalMode, str | None]
 
 
+def _is_meta_confidence_question(text: str) -> bool:
+    lower_text = text.lower()
+    return any(
+        phrase in lower_text
+        for phrase in (
+            "confidence",
+            "uncertain",
+            "missing evidence",
+            "what can you not",
+            "which part is unsupported",
+            "cannot be answered",
+            "could not be answered",
+            "low confidence",
+            "missing from the evidence",
+            "retrieved chunks",
+            "supported by evidence",
+            "which of these answers",
+            "conversation so far",
+        )
+    )
+
+
+def _is_whole_meeting_scope(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(in|across|throughout)\s+(this|the)\s+meeting\b",
+            text.lower(),
+        )
+    )
+
+
+def _is_broad_summary_question(text: str) -> bool:
+    lower_text = text.lower()
+    return any(
+        phrase in lower_text
+        for phrase in (
+            "summarize the whole meeting",
+            "summary of the meeting",
+            "high-level summary",
+            "overall summary",
+            "what did they discuss",
+            "main themes",
+            "broad summary",
+            "main topics discussed",
+            "main topics",
+            "topics discussed",
+            "concerns or risks",
+            "risks were raised",
+            "risks raised",
+            "did the speakers disagree",
+            "disagree on anything",
+            "points of disagreement",
+            "summarize the meeting",
+            "meeting in 5 bullet points",
+            "meeting in 5 bullets",
+        )
+    ) or _is_whole_meeting_scope(lower_text)
+
+
+def _infer_meta_scope(text: str) -> str:
+    lower_text = text.lower()
+    if any(
+        phrase in lower_text
+        for phrase in (
+            "these answers",
+            "recent answers",
+            "across prior answers",
+            "conversation so far",
+            "broader recent conversation",
+            "overall confidence",
+        )
+    ):
+        return "recent_conversation"
+    return "latest_turn"
+
+
 @dataclass(frozen=True)
 class RetrievalPolicy:
     default_factoid_top_k: int
@@ -178,23 +254,16 @@ class Retriever:
     ) -> RetrievalMode:
         lower_query = user_query.lower()
 
-        if rewrite_result.question_relation == "meta_chat_scope":
-            return "meta_or_confidence"
-
-        if any(
-            phrase in lower_query
-            for phrase in (
-                "confidence",
-                "uncertain",
-                "missing evidence",
-                "what can you not",
-                "which part is unsupported",
-            )
+        if rewrite_result.question_relation == "meta_chat_scope" or _is_meta_confidence_question(
+            lower_query
         ):
             return "meta_or_confidence"
 
         if _SPEAKER_TOKEN_PATTERN.search(user_query) or "specific speaker" in lower_query:
             return "speaker_specific"
+
+        if _is_broad_summary_question(lower_query):
+            return "broad_summary"
 
         if any(
             phrase in lower_query
@@ -209,23 +278,37 @@ class Retriever:
                 "decided",
             )
         ):
+            if _is_whole_meeting_scope(lower_query):
+                return "broad_summary"
             return "action_items_or_decisions"
 
-        if any(
-            phrase in lower_query
-            for phrase in (
-                "summarize the whole meeting",
-                "summary of the meeting",
-                "high-level summary",
-                "overall summary",
-                "what did they discuss",
-                "main themes",
-                "broad summary",
-            )
-        ):
-            return "broad_summary"
-
         return "default_factoid"
+
+    def _build_service_metadata(
+        self,
+        *,
+        timings_ms: dict[str, float],
+        cache: dict[str, bool],
+        rewrite_result: QueryRewriteResult,
+        retrieval_mode: RetrievalMode,
+        fast_mode: bool,
+        meta_scope: str | None,
+    ) -> dict[str, object]:
+        return {
+            "timings_ms": timings_ms,
+            "cache": cache,
+            "fast_mode": fast_mode,
+            "rewrite": {
+                "used_fallback": rewrite_result.used_fallback,
+                "fallback_reason": rewrite_result.fallback_reason,
+                "used_cache": rewrite_result.used_cache,
+            },
+            "routing": {
+                "retrieval_mode": retrieval_mode,
+                "question_relation": rewrite_result.question_relation,
+                "meta_scope": meta_scope,
+            },
+        }
 
     def _extract_speaker_filter(self, text: str) -> str | None:
         match = _SPEAKER_TOKEN_PATTERN.search(text)
@@ -319,6 +402,9 @@ class Retriever:
         rewrite_elapsed_ms = elapsed_ms(rewrite_started_at)
 
         retrieval_mode = self._classify_retrieval_mode(normalized_query, rewrite_result)
+        meta_scope = (
+            _infer_meta_scope(normalized_query) if retrieval_mode == "meta_or_confidence" else None
+        )
         speaker_filter = self._extract_speaker_filter(rewrite_result.rewritten_query)
         policy_top_k = self._top_k_for_mode(retrieval_mode)
         final_top_k = top_k or policy_top_k
@@ -366,15 +452,55 @@ class Retriever:
                 question_relation=rewrite_result.question_relation,
                 used_cached_context=True,
                 speaker_filter=speaker_filter,
-                service_metadata={
-                    "timings_ms": timings_ms,
-                    "cache": {
+                service_metadata=self._build_service_metadata(
+                    timings_ms=timings_ms,
+                    cache={
                         "query_rewrite": rewrite_result.used_cache,
                         "query_embedding": False,
                         "retrieval_bundle": False,
                     },
-                    "fast_mode": fast_mode,
-                },
+                    rewrite_result=rewrite_result,
+                    retrieval_mode=retrieval_mode,
+                    fast_mode=fast_mode,
+                    meta_scope=meta_scope,
+                ),
+            )
+
+        if (
+            retrieval_mode == "meta_or_confidence"
+            and conversation_state is not None
+            and (conversation_state.latest_answer is not None or conversation_state.recent_turns)
+        ):
+            timings_ms = {
+                "query_rewrite": rewrite_elapsed_ms,
+                "query_embedding": 0.0,
+                "embedding_query_prep": 0.0,
+                "postgres_retrieval": 0.0,
+                "retrieval": 0.0,
+                "retrieval_total": elapsed_ms(request_started_at),
+            }
+            return RetrievalBundle(
+                meeting_id=normalized_meeting_id,
+                user_query=normalized_query,
+                rewritten_query=rewrite_result.rewritten_query,
+                top_k_used=0,
+                results=[],
+                retrieval_mode=retrieval_mode,
+                question_relation=rewrite_result.question_relation,
+                used_cached_context=True,
+                speaker_filter=None,
+                service_metadata=self._build_service_metadata(
+                    timings_ms=timings_ms,
+                    cache={
+                        "query_rewrite": rewrite_result.used_cache,
+                        "query_embedding": False,
+                        "retrieval_bundle": False,
+                    },
+                    rewrite_result=rewrite_result,
+                    retrieval_mode=retrieval_mode,
+                    fast_mode=fast_mode,
+                    meta_scope=meta_scope,
+                ),
             )
 
         if should_use_cache:
@@ -388,19 +514,22 @@ class Retriever:
                     "retrieval": 0.0,
                     "retrieval_total": elapsed_ms(request_started_at),
                 }
-                metadata = {
-                    "timings_ms": timings_ms,
-                    "cache": {
+                metadata = self._build_service_metadata(
+                    timings_ms=timings_ms,
+                    cache={
                         "query_rewrite": rewrite_result.used_cache,
                         "query_embedding": False,
                         "retrieval_bundle": True,
                     },
-                    "fast_mode": fast_mode,
-                }
+                    rewrite_result=rewrite_result,
+                    retrieval_mode=retrieval_mode,
+                    fast_mode=fast_mode,
+                    meta_scope=meta_scope,
+                )
                 return replace(
                     cached_bundle,
                     user_query=normalized_query,
-                    top_k_used=final_top_k,
+                    top_k_used=min(final_top_k, len(cached_bundle.results)),
                     service_metadata=metadata,
                 )
 
@@ -420,7 +549,7 @@ class Retriever:
         search_top_k = final_top_k
         if retrieval_mode == "broad_summary":
             search_top_k = max(
-                final_top_k,
+                final_top_k * 4,
                 self._policy.broad_summary_max_candidates,
             )
 
@@ -480,15 +609,18 @@ class Retriever:
             question_relation=rewrite_result.question_relation,
             used_cached_context=False,
             speaker_filter=speaker_filter,
-            service_metadata={
-                "timings_ms": timings_ms,
-                "cache": {
+            service_metadata=self._build_service_metadata(
+                timings_ms=timings_ms,
+                cache={
                     "query_rewrite": rewrite_result.used_cache,
                     "query_embedding": embed_cache_hit,
                     "retrieval_bundle": False,
                 },
-                "fast_mode": fast_mode,
-            },
+                rewrite_result=rewrite_result,
+                retrieval_mode=retrieval_mode,
+                fast_mode=fast_mode,
+                meta_scope=meta_scope,
+            ),
         )
 
         if should_use_cache:

@@ -23,6 +23,7 @@ class QueryRewriteResult:
     original_query: str
     rewritten_query: str
     used_fallback: bool
+    fallback_reason: str | None = None
     question_relation: QueryRelation = "standalone_direct"
     was_lossy: bool = False
     used_cache: bool = False

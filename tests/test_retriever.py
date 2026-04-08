@@ -6,6 +6,7 @@ from meeting_pipeline.config import Settings
 from meeting_pipeline.db.pgvector_search import SimilarChunkResult
 from meeting_pipeline.rag.models import (
     ConversationState,
+    ConversationTurnState,
     QueryRewriteResult,
     RetrievalBundle,
     RetrievedChunk,
@@ -296,7 +297,7 @@ def test_retriever_uses_broad_summary_policy_top_k_when_not_overridden() -> None
 
     assert bundle.retrieval_mode == "broad_summary"
     assert bundle.top_k_used == 14
-    assert searcher.last_top_k == 28
+    assert searcher.last_top_k == 56
 
 
 def test_retriever_uses_configured_policy_defaults() -> None:
@@ -364,7 +365,7 @@ def test_retriever_applies_custom_broad_summary_candidate_cap() -> None:
     bundle = retriever.retrieve(meeting_id="m1", user_query="Summarize the whole meeting")
 
     assert bundle.top_k_used == 7
-    assert searcher.last_top_k == 11
+    assert searcher.last_top_k == 28
 
 
 def test_retriever_exposes_timing_metadata() -> None:
@@ -424,3 +425,86 @@ def test_retriever_fast_mode_caps_policy_top_k_when_not_overridden() -> None:
 
     assert bundle.top_k_used == 3
     assert searcher.last_top_k == 3
+
+
+def test_retriever_routes_broad_topic_questions_to_broad_summary() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(rewritten_query="What concerns or risks were raised?"),
+        embedder=FakeEmbedder(),
+    )
+
+    bundle = retriever.retrieve(meeting_id="m1", user_query="What concerns or risks were raised?")
+
+    assert bundle.retrieval_mode == "broad_summary"
+    assert searcher.last_top_k is not None
+    assert searcher.last_top_k > bundle.top_k_used
+
+
+def test_retriever_routes_disagreement_questions_to_broad_summary() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(rewritten_query="Did the speakers disagree on anything?"),
+        embedder=FakeEmbedder(),
+    )
+
+    bundle = retriever.retrieve(
+        meeting_id="m1",
+        user_query="Did the speakers disagree on anything?",
+    )
+
+    assert bundle.retrieval_mode == "broad_summary"
+
+
+def test_retriever_routes_meeting_scoped_decisions_to_broad_summary() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(rewritten_query="What decisions were made in this meeting?"),
+        embedder=FakeEmbedder(),
+    )
+
+    bundle = retriever.retrieve(
+        meeting_id="m1",
+        user_query="What decisions were made in this meeting?",
+    )
+
+    assert bundle.retrieval_mode == "broad_summary"
+
+
+def test_retriever_meta_question_uses_recent_state_without_topical_retrieval() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(rewritten_query="Which of these answers are low confidence?"),
+        embedder=FakeEmbedder(),
+    )
+
+    conversation_state = ConversationState(
+        recent_turns=[
+            ConversationTurnState(
+                question="What decisions were made?",
+                rewritten_query="meeting decisions",
+                retrieval_mode="broad_summary",
+                answer_summary="Some decisions were found.",
+                insufficient_context=True,
+            )
+        ]
+    )
+
+    bundle = retriever.retrieve(
+        meeting_id="m1",
+        user_query="Which of these answers are low confidence?",
+        conversation_state=conversation_state,
+    )
+
+    assert bundle.retrieval_mode == "meta_or_confidence"
+    assert bundle.used_cached_context is True
+    assert bundle.results == []
+    assert searcher.call_count == 0
+
+    routing = bundle.service_metadata.get("routing")
+    assert isinstance(routing, dict)
+    assert routing.get("meta_scope") == "recent_conversation"

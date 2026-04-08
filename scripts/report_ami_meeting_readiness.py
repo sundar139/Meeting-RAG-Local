@@ -11,9 +11,9 @@ from meeting_pipeline.db.connection import connection_scope
 from meeting_pipeline.db.repository import ConnectionProtocol, TranscriptChunkRepository
 
 try:
-    from scripts.ingest_many_meetings import _discover_meeting_ids_from_words_xml
+    from scripts.ingest_many_meetings import discover_meeting_ids
 except ModuleNotFoundError:  # pragma: no cover
-    from ingest_many_meetings import _discover_meeting_ids_from_words_xml
+    from ingest_many_meetings import discover_meeting_ids
 
 LOGGER = logging.getLogger(__name__)
 app = typer.Typer(help="Report AMI meeting readiness across raw/interim/processed/DB assets.")
@@ -38,7 +38,11 @@ def build_readiness_report(
 ) -> list[dict[str, Any]]:
     selected_ids = [item.strip() for item in meeting_ids if item.strip()]
     if not selected_ids:
-        selected_ids = _discover_meeting_ids_from_words_xml(raw_ami_dir)
+        selected_ids = discover_meeting_ids(
+            raw_ami_dir=raw_ami_dir,
+            turns_dir=processed_dir,
+            discovery_source="both",
+        )
 
     report: list[dict[str, Any]] = []
     for meeting_id in sorted(set(selected_ids)):

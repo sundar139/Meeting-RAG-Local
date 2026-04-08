@@ -3,6 +3,8 @@ from __future__ import annotations
 from meeting_pipeline.app.app import (
     _apply_meeting_selection,
     _apply_transcript_filters,
+    _format_rewritten_query_caption,
+    _meeting_availability_hint,
     _run_rag_services,
     _select_default_meeting,
     _user_facing_error_message,
@@ -105,7 +107,17 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
                         "query_rewrite": True,
                         "query_embedding": False,
                         "retrieval_bundle": False,
-                    }
+                    },
+                    "rewrite": {
+                        "used_fallback": True,
+                        "fallback_reason": "rewrite_output_rejected",
+                        "used_cache": False,
+                    },
+                    "routing": {
+                        "retrieval_mode": "default_factoid",
+                        "question_relation": "standalone_direct",
+                        "meta_scope": None,
+                    },
                 },
             )
 
@@ -161,8 +173,36 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
     assert isinstance(cache, dict)
     assert cache.get("query_rewrite") is True
     assert cache.get("answer_generation") is True
+    rewrite = answer.service_metadata.get("rewrite")
+    assert isinstance(rewrite, dict)
+    assert rewrite.get("used_fallback") is True
+    routing = answer.service_metadata.get("routing")
+    assert isinstance(routing, dict)
+    assert routing.get("retrieval_mode") == "default_factoid"
 
 
 def test_user_facing_error_message_maps_known_service_errors() -> None:
     assert "PostgreSQL" in _user_facing_error_message(DatabaseConnectionError("db down"))
     assert "Ollama" in _user_facing_error_message(OllamaUnavailableError("offline"))
+
+
+def test_format_rewritten_query_caption_includes_fallback_reason() -> None:
+    caption = _format_rewritten_query_caption(
+        question="What were the main topics discussed?",
+        rewritten_query="What were the main topics discussed?",
+        service_metadata={
+            "rewrite": {
+                "used_fallback": True,
+                "fallback_reason": "rewrite_output_rejected",
+                "used_cache": False,
+            }
+        },
+    )
+
+    assert "fallback to original" in caption
+    assert "rewrite output rejected" in caption
+
+
+def test_meeting_availability_hint_only_for_single_meeting() -> None:
+    assert _meeting_availability_hint(["EN2002a"]) is not None
+    assert _meeting_availability_hint(["EN2002a", "ES2004c"]) is None

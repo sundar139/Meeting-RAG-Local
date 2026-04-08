@@ -14,27 +14,130 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_CHAT_MODEL = "llama3.2:3b-instruct"
 _SPEAKER_TOKEN_PATTERN = re.compile(r"\bSPEAKER_\d+\b", re.IGNORECASE)
 _YEAR_OR_NUMBER_PATTERN = re.compile(r"\b\d{2,4}\b")
+_REWRITE_PREFIX_PATTERN = re.compile(
+    r"^(?:final\s+answer|answer|rewritten\s+query|query)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+_MIN_REWRITE_CHARS = 8
+_MAX_REWRITE_CHARS = 280
+_MAX_REWRITE_WORDS = 48
+
+
+def _is_meta_confidence_question(normalized_question: str) -> bool:
+    lower_question = normalized_question.lower()
+    meta_phrases = (
+        "your previous",
+        "you said",
+        "earlier answer",
+        "confidence",
+        "uncertain",
+        "missing evidence",
+        "what can you not",
+        "what parts of your answer",
+        "cannot be answered",
+        "could not be answered",
+        "low confidence",
+        "missing from the evidence",
+        "retrieved chunks",
+        "supported by evidence",
+        "unsupported",
+        "which of these answers",
+        "broader recent conversation",
+        "conversation so far",
+    )
+    return any(phrase in lower_question for phrase in meta_phrases)
+
+
+def _has_reasoning_markers(text: str) -> bool:
+    lower_text = text.lower()
+    markers = (
+        "chain of thought",
+        "let's think",
+        "let us think",
+        "step by step",
+        "reasoning:",
+        "analysis:",
+        "thought process",
+        "final answer:",
+        "\\boxed{",
+        "<think>",
+        "</think>",
+    )
+    return any(marker in lower_text for marker in markers)
+
+
+def _sanitize_rewrite_output(raw_text: str) -> str | None:
+    text = raw_text.strip()
+    if not text:
+        return None
+
+    if text.startswith("```"):
+        stripped = text.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:]
+        text = stripped.strip()
+
+    boxed_match = re.search(r"\\boxed\{([^{}]+)\}", text)
+    if boxed_match is not None:
+        text = boxed_match.group(1).strip()
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) > 1:
+        text = lines[-1]
+    else:
+        text = lines[0]
+
+    text = _REWRITE_PREFIX_PATTERN.sub("", text).strip()
+    text = text.strip("`\"'")
+
+    normalized = " ".join(text.split())
+    return normalized or None
+
+
+def _is_valid_rewrite_output(candidate: str) -> bool:
+    if len(candidate) < _MIN_REWRITE_CHARS or len(candidate) > _MAX_REWRITE_CHARS:
+        return False
+
+    if len(candidate.split()) > _MAX_REWRITE_WORDS:
+        return False
+
+    lower_candidate = candidate.lower()
+    if _has_reasoning_markers(candidate):
+        return False
+
+    if any(
+        phrase in lower_candidate
+        for phrase in (
+            "this question asks",
+            "the user asks",
+            "to answer this",
+            "i should",
+            "we should",
+            "here is",
+        )
+    ):
+        return False
+
+    if re.search(r"\b(?:step\s*\d+|first,|second,|third,)\b", lower_candidate):
+        return False
+
+    if candidate.count(". ") >= 4:
+        return False
+
+    return True
 
 
 def _infer_question_relation(
     normalized_question: str,
     context_lines: Sequence[str],
 ) -> QueryRelation:
-    lower_question = normalized_question.lower()
-    if any(
-        phrase in lower_question
-        for phrase in (
-            "your previous",
-            "you said",
-            "earlier answer",
-            "confidence",
-            "uncertain",
-            "missing evidence",
-            "what can you not",
-            "what parts of your answer",
-        )
-    ):
+    if _is_meta_confidence_question(normalized_question):
         return "meta_chat_scope"
+
+    lower_question = normalized_question.lower()
 
     if context_lines and re.search(
         r"\b(that|those|it|they|them|this|these|earlier)\b",
@@ -186,6 +289,7 @@ class QueryRewriter:
                 original_query=normalized_question,
                 rewritten_query=normalized_question,
                 used_fallback=True,
+                fallback_reason="fast_mode_skip",
                 question_relation=question_relation,
                 was_lossy=False,
                 used_cache=False,
@@ -199,6 +303,7 @@ class QueryRewriter:
                 original_query=normalized_question,
                 rewritten_query=normalized_question,
                 used_fallback=True,
+                fallback_reason="meta_question",
                 question_relation=question_relation,
                 was_lossy=False,
                 used_cache=False,
@@ -231,9 +336,17 @@ class QueryRewriter:
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            normalized_rewrite = " ".join(rewritten.split())
-            if not normalized_rewrite:
-                raise ValueError("empty rewrite")
+            if _has_reasoning_markers(rewritten):
+                raise ValueError("rewrite contains reasoning markers")
+
+            sanitized_rewrite = _sanitize_rewrite_output(rewritten)
+            if sanitized_rewrite is None:
+                raise ValueError("rewrite sanitization failed")
+
+            if not _is_valid_rewrite_output(sanitized_rewrite):
+                raise ValueError("rewrite validation failed")
+
+            normalized_rewrite = sanitized_rewrite
 
             if _rewrite_is_lossy(normalized_question, normalized_rewrite):
                 LOGGER.info("Rewrite deemed lossy; preserving original query.")
@@ -241,6 +354,7 @@ class QueryRewriter:
                     original_query=normalized_question,
                     rewritten_query=normalized_question,
                     used_fallback=True,
+                    fallback_reason="lossy_rewrite",
                     question_relation=question_relation,
                     was_lossy=True,
                     used_cache=False,
@@ -253,6 +367,7 @@ class QueryRewriter:
                 original_query=normalized_question,
                 rewritten_query=normalized_rewrite,
                 used_fallback=False,
+                fallback_reason=None,
                 question_relation=question_relation,
                 was_lossy=False,
                 used_cache=False,
@@ -262,10 +377,16 @@ class QueryRewriter:
             return result
         except (OllamaClientError, ValueError) as exc:
             LOGGER.warning("Query rewriting failed; using fallback query. reason=%s", exc)
+            fallback_reason = (
+                "rewrite_generation_failed"
+                if isinstance(exc, OllamaClientError)
+                else "rewrite_output_rejected"
+            )
             fallback_result = QueryRewriteResult(
                 original_query=normalized_question,
                 rewritten_query=normalized_question,
                 used_fallback=True,
+                fallback_reason=fallback_reason,
                 question_relation=question_relation,
                 was_lossy=False,
                 used_cache=False,
