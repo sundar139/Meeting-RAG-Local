@@ -131,6 +131,7 @@ def test_answer_generator_can_build_meta_answer_from_recent_state() -> None:
         },
         raw_answer="raw",
         insufficient_context=True,
+        confidence_tier="insufficient_evidence",
     )
     recent_bundle = RetrievalBundle(
         meeting_id="m1",
@@ -154,6 +155,7 @@ def test_answer_generator_can_build_meta_answer_from_recent_state() -> None:
 
     assert "Confidence review" in result.sections["Summary"]
     assert "Prior uncertainty notes" in result.sections["Uncertainties / Missing Evidence"]
+    assert result.confidence_tier == "insufficient_evidence"
     assert client.call_count == 0
 
 
@@ -310,7 +312,8 @@ def test_answer_generator_builds_recent_conversation_meta_review() -> None:
 
     assert "recent conversation state" in result.sections["Summary"]
     assert "Low-confidence recent questions" in result.sections["Uncertainties / Missing Evidence"]
-    assert result.insufficient_context is True
+    assert result.insufficient_context is False
+    assert result.confidence_tier == "partial_limited_evidence"
     assert client.call_count == 0
 
 
@@ -327,8 +330,99 @@ def test_answer_generator_broad_summary_reports_insufficient_evidence_cleanly() 
     )
 
     assert result.insufficient_context is True
-    assert result.sections["Summary"].count("- ") == 5
+    assert result.confidence_tier == "insufficient_evidence"
+    assert "Unable to produce 5 unique" in result.sections["Summary"]
     assert (
         "Current retrieval mode: broad_summary"
         in result.sections["Uncertainties / Missing Evidence"]
     )
+
+
+def test_answer_generator_cleans_repetitive_bullets_without_filler_loops() -> None:
+    client = FakeChatClient(
+        '{"Summary":"- Risk remains.\\n- Risk remains.\\n- Risk remains.",'
+        '"Key Points":"- Duplicate point.\\n- Duplicate point.",'
+        '"Decisions":"None",'
+        '"Action Items":"None",'
+        '"Uncertainties / Missing Evidence":"Limited evidence."}'
+    )
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    result = generator.generate(
+        user_question="Summarize in 3 bullet points",
+        meeting_id="m1",
+        rewritten_query="summary bullets",
+        retrieved_evidence=_sample_evidence(),
+    )
+
+    assert "Unable to produce 3 unique" in result.sections["Summary"]
+    assert result.confidence_tier == "partial_limited_evidence"
+
+
+def test_answer_generator_speaker_topic_analysis_uses_evidence_stats() -> None:
+    client = FakeChatClient('{"Summary":"unused"}')
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    evidence = [
+        RetrievedChunk(
+            chunk_id=1,
+            meeting_id="m1",
+            speaker_label="SPEAKER_00",
+            start_time=0.0,
+            end_time=20.0,
+            content="[SPEAKER_00 0.00-20.00] planning milestones",
+            similarity=0.9,
+        ),
+        RetrievedChunk(
+            chunk_id=2,
+            meeting_id="m1",
+            speaker_label="SPEAKER_00",
+            start_time=20.0,
+            end_time=40.0,
+            content="[SPEAKER_00 20.00-40.00] decision framing",
+            similarity=0.88,
+        ),
+        RetrievedChunk(
+            chunk_id=3,
+            meeting_id="m1",
+            speaker_label="SPEAKER_01",
+            start_time=40.0,
+            end_time=50.0,
+            content="[SPEAKER_01 40.00-50.00] risk notes",
+            similarity=0.84,
+        ),
+    ]
+
+    result = generator.generate(
+        user_question="Which speaker talked the most about planning or decision-making?",
+        meeting_id="m1",
+        rewritten_query="speaker planning contributions",
+        retrieved_evidence=evidence,
+        retrieval_mode="broad_summary",
+    )
+
+    assert "SPEAKER_00" in result.sections["Summary"]
+    assert "supporting chunks" in result.sections["Key Points"]
+    assert result.confidence_tier == "grounded"
+    assert client.call_count == 0
+
+
+def test_answer_generator_assigns_partial_confidence_when_citations_missing() -> None:
+    client = FakeChatClient(
+        '{"Summary":"The team discussed launch planning.",'
+        '"Key Points":"A planning discussion occurred.",'
+        '"Decisions":"A launch target was mentioned.",'
+        '"Action Items":"Follow-up was suggested.",'
+        '"Uncertainties / Missing Evidence":"Coverage is limited."}'
+    )
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    result = generator.generate(
+        user_question="What happened in planning?",
+        meeting_id="m1",
+        rewritten_query="planning discussion",
+        retrieved_evidence=_sample_evidence(),
+    )
+
+    assert result.confidence_tier == "partial_limited_evidence"
+    assert result.insufficient_context is False

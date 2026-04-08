@@ -157,6 +157,7 @@ def run_smoke(
         "answer": {
             "sections": answer.sections,
             "insufficient_context": answer.insufficient_context,
+            "confidence_tier": answer.confidence_tier,
             "raw_answer": answer.raw_answer,
             "service_metadata": answer.service_metadata,
         },

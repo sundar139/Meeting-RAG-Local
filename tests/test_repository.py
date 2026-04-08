@@ -94,6 +94,7 @@ def test_insert_transcript_chunk_executes_parameterized_sql() -> None:
     assert params is not None
     assert params[0] == "meeting-123"
     assert params[1] == "spk_0"
+    assert params[6] is None
 
 
 def test_insert_transcript_chunk_rejects_bad_content() -> None:
@@ -160,8 +161,8 @@ def test_insert_transcript_chunks_uses_batch_execution() -> None:
 def test_get_chunks_by_meeting_maps_rows_and_limit() -> None:
     cursor = _make_cursor()
     cursor.fetchall_result = [
-        (1, "m1", "spk_0", 0.0, 1.0, "hello"),
-        (2, "m1", "spk_1", 1.1, 2.0, "world"),
+        (1, "m1", "spk_0", 0.0, 1.0, "hello", "chunk-a"),
+        (2, "m1", "spk_1", 1.1, 2.0, "world", "chunk-b"),
     ]
     repository = TranscriptChunkRepository(RecordingConnection(cursor))
 
@@ -169,8 +170,28 @@ def test_get_chunks_by_meeting_maps_rows_and_limit() -> None:
 
     assert len(chunks) == 2
     assert chunks[0].chunk_id == 1
+    assert chunks[0].chunk_key == "chunk-a"
     _, params = cursor.executed[0]
     assert params == ("m1", 1)
+
+
+def test_insert_transcript_chunk_accepts_chunk_key() -> None:
+    cursor = _make_cursor()
+    conn = RecordingConnection(cursor)
+    repository = TranscriptChunkRepository(conn)
+
+    repository.insert_transcript_chunk(
+        meeting_id="meeting-123",
+        speaker_label="spk_0",
+        start_time=0.0,
+        end_time=1.2,
+        content="hello world",
+        chunk_key="stable-key-001",
+    )
+
+    _, params = cursor.executed[0]
+    assert params is not None
+    assert params[6] == "stable-key-001"
 
 
 def test_delete_chunks_for_meeting_returns_deleted_count() -> None:

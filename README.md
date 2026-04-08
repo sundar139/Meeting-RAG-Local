@@ -15,7 +15,8 @@ Core outcomes:
 
 - Parse and normalize AMI meeting assets.
 - Build canonical speaker turns from alignment and diarization outputs.
-- Embed and index turns in PostgreSQL + pgvector.
+- Build derived retrieval chunks (windowed with overlap) from canonical turns.
+- Embed and index retrieval chunks in PostgreSQL + pgvector.
 - Retrieve evidence adaptively by question intent.
 - Generate grounded answer sections with explicit insufficient-context handling.
 - Provide a local Streamlit interface for transcript browsing and evidence-aware chat.
@@ -102,10 +103,11 @@ How:
 What:
 
 - Merges aligned transcript data and diarization segments into canonical speaker turns.
+- Preserves canonical turns as source artifacts for browsing and traceability.
 
 Why:
 
-- Creates retrieval-ready units with clear speaker and time boundaries.
+- Keeps a stable turn-level artifact while allowing retrieval-specific chunking to evolve.
 
 How:
 
@@ -113,15 +115,23 @@ How:
 - Core logic: meeting_pipeline.audio.turn_builder
 - Output: data/processed/<meeting_id>_turns.json
 
+Derived retrieval chunking:
+
+- During ingestion, canonical turns are transformed into retrieval chunks using windowed chunking.
+- Default settings target broader semantic context:
+  - `RETRIEVAL_CHUNK_WINDOW_SECONDS=45`
+  - `RETRIEVAL_CHUNK_OVERLAP_SECONDS=15`
+- Overlap is deduped with deterministic chunk keys to reduce duplicate explosion.
+
 ### 4) Embedding ingestion and persistence
 
 What:
 
-- Embeds transcript turns and stores them in PostgreSQL with pgvector support.
+- Builds retrieval chunks from canonical turns, embeds them, and stores them in PostgreSQL.
 
 Why:
 
-- Enables semantic retrieval scoped by meeting ID and optional speaker constraints.
+- Improves broad-question recall with larger semantic windows while preserving turn artifacts.
 
 How:
 
@@ -173,6 +183,23 @@ Broad-summary support:
 
 - Whole-meeting and broad-topic questions route to `broad_summary` retrieval mode.
 - Broad-summary retrieval uses wider candidate retrieval plus speaker/time diversification.
+- Broad-summary evidence assembly now dedupes near-identical overlap-heavy chunks.
+
+Confidence tiering:
+
+- Answer confidence is calibrated into explicit tiers:
+  - `grounded`
+  - `partial_limited_evidence`
+  - `insufficient_evidence`
+- When evidence is too weak, answers fall back to a concise explicit
+  "cannot answer confidently from retrieved evidence" response.
+
+Speaker topical analysis:
+
+- Questions like "Which speaker talked the most about planning?" trigger speaker-level
+  evidence aggregation over retrieved chunks.
+- The answer includes per-speaker chunk counts and approximate evidence span before
+  making a ranked claim.
 
 ### 6) Streamlit app and diagnostics
 
@@ -193,6 +220,7 @@ How:
   - Meeting selection and transcript filtering
   - Grounded answer sections and evidence expansion
   - Debug latency and cache summaries
+  - One-click whole-meeting summary shortcuts (default and 5-bullet)
   - Fast mode toggle
 
 ### 7) Evaluation tooling
@@ -382,6 +410,14 @@ ollama pull nomic-embed-text-v2-moe
 ollama pull qwen3:4b
 ```
 
+6) Optional retrieval chunk tuning.
+
+```bash
+# defaults shown
+RETRIEVAL_CHUNK_WINDOW_SECONDS=45
+RETRIEVAL_CHUNK_OVERLAP_SECONDS=15
+```
+
 ### End-to-end pipeline example
 
 ```bash
@@ -393,12 +429,18 @@ uv run python scripts/ingest_embeddings.py --meeting-id ES2002a --turns-path dat
 uv run streamlit run src/meeting_pipeline/app/app.py
 ```
 
+Chunking override example:
+
+```bash
+uv run python scripts/ingest_embeddings.py --meeting-id ES2002a --turns-path data/processed/ES2002a_turns.json --replace-existing --batch-size 16 --retrieval-chunk-window-seconds 60 --retrieval-chunk-overlap-seconds 20
+```
+
 ### Useful operational commands
 
 - Batch ingestion:
 
 ```bash
-uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16
+uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --skip-existing --batch-size 16 --retrieval-chunk-window-seconds 45 --retrieval-chunk-overlap-seconds 15
 ```
 
 - Multi-meeting discovery plan:
@@ -460,6 +502,22 @@ uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns
 
 ```bash
 uv run streamlit run src/meeting_pipeline/app/app.py
+```
+
+### Migration and re-ingestion after retrieval chunk update
+
+If upgrading from older turn-level embeddings:
+
+1. Apply latest DB migrations:
+
+```bash
+uv run python scripts/run_migrations.py
+```
+
+2. Re-ingest meetings with replacement enabled to rebuild retrieval chunks:
+
+```bash
+uv run python scripts/ingest_many_meetings.py --raw-ami-dir data/raw/ami --turns-dir data/processed --replace-existing --batch-size 16 --discovery-source both
 ```
 
 ## Running Tests and Quality Checks

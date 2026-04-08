@@ -45,6 +45,11 @@ def _is_meta_confidence_question(normalized_question: str) -> bool:
         "which of these answers",
         "broader recent conversation",
         "conversation so far",
+        "which of my questions",
+        "which questions were low confidence",
+        "what could not be answered confidently",
+        "across these answers",
+        "in this chat",
     )
     return any(phrase in lower_question for phrase in meta_phrases)
 

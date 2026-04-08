@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from meeting_pipeline.audio.retrieval_chunk_builder import RetrievalChunkWindow
 from meeting_pipeline.embeddings.ollama_client import OllamaClientError
 from scripts.ingest_embeddings import ingest_embeddings
 
@@ -159,3 +160,59 @@ class _FakeConnCtx:
         _ = exc
         _ = tb
         return None
+
+
+def test_ingest_embeddings_supports_window_override(tmp_path: Path, monkeypatch) -> None:
+    turns_path = tmp_path / "turns.json"
+    _write_turns(
+        turns_path,
+        {
+            "meeting_id": "ES2002a",
+            "turns": [
+                {
+                    "meeting_id": "ES2002a",
+                    "speaker_label": "SPEAKER_00",
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                    "text": "hello world",
+                }
+            ],
+        },
+    )
+
+    captured: dict[str, float] = {}
+
+    def fake_build_retrieval_chunks(*, meeting_id, turns, window_seconds, overlap_seconds):
+        _ = meeting_id
+        _ = turns
+        captured["window"] = float(window_seconds)
+        captured["overlap"] = float(overlap_seconds)
+        return [
+            RetrievalChunkWindow(
+                chunk_key="abc123",
+                meeting_id="ES2002a",
+                speaker_label="SPEAKER_00",
+                start_time=0.0,
+                end_time=1.0,
+                content="[SPEAKER_00 0.00-1.00] hello world",
+                source_turn_count=1,
+            )
+        ]
+
+    monkeypatch.setattr("scripts.ingest_embeddings.Embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(
+        "scripts.ingest_embeddings.build_retrieval_chunks",
+        fake_build_retrieval_chunks,
+    )
+
+    summary = ingest_embeddings(
+        meeting_id="ES2002a",
+        turns_path=turns_path,
+        dry_run=True,
+        retrieval_chunk_window_seconds=60.0,
+        retrieval_chunk_overlap_seconds=20.0,
+    )
+
+    assert summary["rows_inserted"] == 1
+    assert captured["window"] == 60.0
+    assert captured["overlap"] == 20.0

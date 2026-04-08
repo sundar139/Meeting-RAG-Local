@@ -17,6 +17,12 @@ RetrievalMode = Literal[
     "default_factoid",
 ]
 
+ConfidenceTier = Literal[
+    "grounded",
+    "partial_limited_evidence",
+    "insufficient_evidence",
+]
+
 
 @dataclass(frozen=True)
 class QueryRewriteResult:
@@ -38,6 +44,7 @@ class RetrievedChunk:
     end_time: float
     content: str
     similarity: float
+    chunk_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,7 @@ class GroundedAnswerResult:
     sections: dict[str, str]
     raw_answer: str
     insufficient_context: bool
+    confidence_tier: ConfidenceTier = "grounded"
     service_metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -80,6 +88,9 @@ class ConversationTurnState:
     retrieval_mode: RetrievalMode
     answer_summary: str
     insufficient_context: bool
+    confidence_tier: ConfidenceTier = "grounded"
+    evidence_count: int = 0
+    uncertainty_notes: str = ""
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,8 @@ from typing import Any
 
 import typer
 
+from meeting_pipeline.audio.retrieval_chunk_builder import build_retrieval_chunks
+from meeting_pipeline.config import get_settings
 from meeting_pipeline.db.connection import connection_scope
 from meeting_pipeline.db.repository import TranscriptChunkInsert, TranscriptChunkRepository
 from meeting_pipeline.embeddings.embedder import Embedder
@@ -73,7 +75,7 @@ def _validate_turns(payload: dict[str, Any], meeting_id: str) -> list[SpeakerTur
     return validated
 
 
-def _embed_with_retry(embedder: Embedder, text: str, turn_index: int) -> list[float]:
+def _embed_with_retry(embedder: Embedder, text: str, item_index: int) -> list[float]:
     last_error: Exception | None = None
     for attempt in range(1, MAX_EMBED_RETRIES + 1):
         try:
@@ -84,14 +86,14 @@ def _embed_with_retry(embedder: Embedder, text: str, turn_index: int) -> list[fl
                 break
             LOGGER.warning(
                 "Embedding retry for turn=%d attempt=%d reason=%s",
-                turn_index,
+                item_index,
                 attempt,
                 exc,
             )
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     raise RuntimeError(
-        f"Embedding failed for turn index {turn_index} after {MAX_EMBED_RETRIES} attempts"
+        f"Embedding failed for item index {item_index} after {MAX_EMBED_RETRIES} attempts"
     ) from last_error
 
 
@@ -106,6 +108,8 @@ def ingest_embeddings(
     replace_existing: bool = False,
     batch_size: int = 16,
     dry_run: bool = False,
+    retrieval_chunk_window_seconds: float | None = None,
+    retrieval_chunk_overlap_seconds: float | None = None,
 ) -> dict[str, int | str]:
     normalized_meeting_id = meeting_id.strip()
     if not normalized_meeting_id:
@@ -118,6 +122,7 @@ def ingest_embeddings(
 
     turns_loaded = len(turns)
     turns_skipped = 0
+    retrieval_chunks_built = 0
     embeddings_attempted = 0
     embeddings_succeeded = 0
 
@@ -131,21 +136,48 @@ def ingest_embeddings(
         dedupe_seen.add(key)
         unique_turns.append(turn)
 
+    settings = get_settings()
+    resolved_window_seconds = (
+        float(retrieval_chunk_window_seconds)
+        if retrieval_chunk_window_seconds is not None
+        else settings.retrieval_chunk_window_seconds
+    )
+    resolved_overlap_seconds = (
+        float(retrieval_chunk_overlap_seconds)
+        if retrieval_chunk_overlap_seconds is not None
+        else settings.retrieval_chunk_overlap_seconds
+    )
+
+    retrieval_chunks = build_retrieval_chunks(
+        meeting_id=normalized_meeting_id,
+        turns=unique_turns,
+        window_seconds=resolved_window_seconds,
+        overlap_seconds=resolved_overlap_seconds,
+    )
+    retrieval_chunks_built = len(retrieval_chunks)
+    if not retrieval_chunks:
+        raise ValueError("No retrieval chunks were generated from turns artifact")
+
     embedder = Embedder()
 
     insert_rows: list[TranscriptChunkInsert] = []
-    for index, turn in enumerate(unique_turns):
+    for index, retrieval_chunk in enumerate(retrieval_chunks):
         embeddings_attempted += 1
-        embedding = _embed_with_retry(embedder=embedder, text=turn.text, turn_index=index)
+        embedding = _embed_with_retry(
+            embedder=embedder,
+            text=retrieval_chunk.content,
+            item_index=index,
+        )
         embeddings_succeeded += 1
         insert_rows.append(
             TranscriptChunkInsert(
                 meeting_id=normalized_meeting_id,
-                speaker_label=turn.speaker_label,
-                start_time=turn.start_time,
-                end_time=turn.end_time,
-                content=turn.text,
+                speaker_label=retrieval_chunk.speaker_label,
+                start_time=retrieval_chunk.start_time,
+                end_time=retrieval_chunk.end_time,
+                content=retrieval_chunk.content,
                 embedding=embedding,
+                chunk_key=retrieval_chunk.chunk_key,
             )
         )
 
@@ -168,6 +200,9 @@ def ingest_embeddings(
         "meeting_id": normalized_meeting_id,
         "turns_loaded": turns_loaded,
         "turns_skipped": turns_skipped,
+        "retrieval_chunks_built": retrieval_chunks_built,
+        "retrieval_chunk_window_seconds": f"{resolved_window_seconds:.2f}",
+        "retrieval_chunk_overlap_seconds": f"{resolved_overlap_seconds:.2f}",
         "embeddings_attempted": embeddings_attempted,
         "embeddings_succeeded": embeddings_succeeded,
         "rows_deleted": rows_deleted,
@@ -177,6 +212,9 @@ def ingest_embeddings(
     LOGGER.info("meeting_id=%s", normalized_meeting_id)
     LOGGER.info("turns_loaded=%d", turns_loaded)
     LOGGER.info("turns_skipped=%d", turns_skipped)
+    LOGGER.info("retrieval_chunks_built=%d", retrieval_chunks_built)
+    LOGGER.info("retrieval_chunk_window_seconds=%.2f", resolved_window_seconds)
+    LOGGER.info("retrieval_chunk_overlap_seconds=%.2f", resolved_overlap_seconds)
     LOGGER.info("embeddings_attempted=%d", embeddings_attempted)
     LOGGER.info("embeddings_succeeded=%d", embeddings_succeeded)
     LOGGER.info("rows_deleted=%d", rows_deleted)
@@ -193,6 +231,14 @@ def main(
     replace_existing: bool = typer.Option(False, "--replace-existing"),
     batch_size: int = typer.Option(16, "--batch-size"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    retrieval_chunk_window_seconds: float | None = typer.Option(
+        None,
+        "--retrieval-chunk-window-seconds",
+    ),
+    retrieval_chunk_overlap_seconds: float | None = typer.Option(
+        None,
+        "--retrieval-chunk-overlap-seconds",
+    ),
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
@@ -202,6 +248,8 @@ def main(
             replace_existing=replace_existing,
             batch_size=batch_size,
             dry_run=dry_run,
+            retrieval_chunk_window_seconds=retrieval_chunk_window_seconds,
+            retrieval_chunk_overlap_seconds=retrieval_chunk_overlap_seconds,
         )
     except Exception as exc:
         LOGGER.error("embedding ingestion failed: %s", exc)

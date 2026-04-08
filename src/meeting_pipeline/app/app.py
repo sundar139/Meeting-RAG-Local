@@ -508,6 +508,12 @@ def main() -> None:
         if st.sidebar.button(suggested, key=f"suggested_{idx}", use_container_width=True):
             state["pending_question"] = suggested
 
+    st.sidebar.subheader("Whole-meeting summary")
+    if st.sidebar.button("Whole-meeting summary", use_container_width=True):
+        state["pending_question"] = "Summarize the whole meeting with grounded evidence."
+    if st.sidebar.button("Whole-meeting summary (5 bullets)", use_container_width=True):
+        state["pending_question"] = "Summarize the whole meeting in 5 bullet points."
+
     try:
         with st.spinner("Loading transcript and meeting details..."):
             overview, speakers, chunks = _load_meeting_data_cached(state, selected_meeting)
@@ -558,6 +564,7 @@ def main() -> None:
                     top_k_used=max(turn_top_k, 1),
                     used_cached_context=bool(turn.get("used_cached_context", False)),
                     insufficient_context=bool(answer.insufficient_context),
+                    confidence_tier=str(turn.get("confidence_tier", answer.confidence_tier)),
                     service_metadata=turn_service_metadata,
                     show_latency=debug_mode,
                 )
@@ -634,6 +641,9 @@ def main() -> None:
                     retrieval_mode=bundle.retrieval_mode,
                     answer_summary=answer.sections.get("Summary", ""),
                     insufficient_context=answer.insufficient_context,
+                    confidence_tier=answer.confidence_tier,
+                    evidence_count=len(bundle.results),
+                    uncertainty_notes=answer.sections.get("Uncertainties / Missing Evidence", ""),
                 )
             )
             if len(state["recent_turn_states"]) > 10:
@@ -647,6 +657,7 @@ def main() -> None:
                     "retrieval_mode": bundle.retrieval_mode,
                     "top_k_used": bundle.top_k_used,
                     "used_cached_context": bundle.used_cached_context,
+                    "confidence_tier": answer.confidence_tier,
                     "service_metadata": answer.service_metadata,
                 }
             )
@@ -657,6 +668,7 @@ def main() -> None:
                     top_k_used=bundle.top_k_used,
                     used_cached_context=bundle.used_cached_context,
                     insufficient_context=answer.insufficient_context,
+                    confidence_tier=answer.confidence_tier,
                     service_metadata=answer.service_metadata,
                     show_latency=debug_mode,
                 )

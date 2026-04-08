@@ -4,13 +4,14 @@ import json
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha1
 
 from meeting_pipeline.cache_utils import LruCache
 from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClient, OllamaClientError
 from meeting_pipeline.rag.models import (
+    ConfidenceTier,
     ConversationState,
     ConversationTurnState,
     FormatDirectives,
@@ -22,6 +23,14 @@ from meeting_pipeline.timing import elapsed_ms, now
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CHAT_MODEL = "llama3.2:3b-instruct"
+_SPEAKER_CONTENT_PATTERN = re.compile(r"\[(SPEAKER_\d+)\s", re.IGNORECASE)
+_INSUFFICIENT_MARKERS = (
+    "insufficient",
+    "cannot answer confidently",
+    "unable to answer confidently",
+    "no supporting evidence",
+    "not enough evidence",
+)
 SECTION_ORDER = [
     "Summary",
     "Key Points",
@@ -38,6 +47,13 @@ class EvidenceCompactionPolicy:
     max_chunks: int
     max_total_chars: int
     max_chunk_chars: int
+
+
+@dataclass
+class SpeakerEvidenceAggregate:
+    chunk_count: int = 0
+    total_span_seconds: float = 0.0
+    chunk_ids: list[int] = field(default_factory=list)
 
 
 def _format_directives_signature(directives: FormatDirectives) -> tuple[object, ...]:
@@ -217,6 +233,7 @@ class AnswerGenerator:
 
             sections = _build_insufficient_sections(retrieval_mode)
             sections = _apply_format_directives(sections, directives)
+            sections = _cleanup_repetitive_bullets(sections)
             raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
             return _with_answer_timing(
                 GroundedAnswerResult(
@@ -226,7 +243,38 @@ class AnswerGenerator:
                     sections=sections,
                     raw_answer=raw_answer,
                     insufficient_context=True,
+                    confidence_tier="insufficient_evidence",
                 ),
+                generation_started_at,
+                cache_metadata={
+                    "answer_generation": False,
+                },
+                compaction_metadata=compaction_metadata,
+                fast_mode=fast_mode,
+            )
+
+        if _is_speaker_topic_analysis_question(normalized_question):
+            sections, confidence_tier, speaker_stats = _build_speaker_topic_sections(
+                question=normalized_question,
+                evidence=compacted_evidence,
+            )
+            sections = _apply_format_directives(sections, directives)
+            sections = _cleanup_repetitive_bullets(sections)
+            raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
+            result = GroundedAnswerResult(
+                meeting_id=normalized_meeting_id,
+                question=normalized_question,
+                rewritten_query=normalized_rewrite,
+                sections=sections,
+                raw_answer=raw_answer,
+                insufficient_context=confidence_tier == "insufficient_evidence",
+                confidence_tier=confidence_tier,
+                service_metadata={"speaker_topic_stats": speaker_stats},
+            )
+            if should_use_cache:
+                self._answer_cache.set(cache_key, replace(result, service_metadata={}))
+            return _with_answer_timing(
+                result,
                 generation_started_at,
                 cache_metadata={
                     "answer_generation": False,
@@ -262,6 +310,8 @@ class AnswerGenerator:
             "Do not invent facts. If evidence is insufficient, explicitly say so. "
             f"Routing mode: {retrieval_mode}. {mode_instruction} "
             f"Formatting guidance: {format_instruction_block} "
+            "When generating bullets, every bullet must be unique, non-overlapping, and grounded. "
+            "Do not repeat rephrased versions of the same claim. "
             "Respond in strict JSON with keys: Summary, Key Points, Decisions, Action Items, "
             "Uncertainties / Missing Evidence. Include local citations like "
             "[chunk_id:12 speaker:SPEAKER_01 32.4-48.2] in statements where evidence "
@@ -290,7 +340,17 @@ class AnswerGenerator:
 
         sections = _parse_structured_sections(raw_answer)
         sections = _apply_format_directives(sections, directives)
-        insufficient = _is_insufficient_answer(sections)
+        sections = _cleanup_repetitive_bullets(sections)
+
+        confidence_tier = _calibrate_confidence_tier(
+            sections=sections,
+            evidence_count=len(compacted_evidence),
+            retrieval_mode=retrieval_mode,
+        )
+        if confidence_tier == "insufficient_evidence":
+            sections = _build_insufficient_sections(retrieval_mode)
+            sections = _apply_format_directives(sections, directives)
+            sections = _cleanup_repetitive_bullets(sections)
 
         result = GroundedAnswerResult(
             meeting_id=normalized_meeting_id,
@@ -298,7 +358,8 @@ class AnswerGenerator:
             rewritten_query=normalized_rewrite,
             sections=sections,
             raw_answer=raw_answer,
-            insufficient_context=insufficient,
+            insufficient_context=confidence_tier == "insufficient_evidence",
+            confidence_tier=confidence_tier,
         )
         if should_use_cache:
             self._answer_cache.set(cache_key, replace(result, service_metadata={}))
@@ -354,23 +415,231 @@ def _parse_structured_sections(raw_answer: str) -> dict[str, str]:
     return sections
 
 
-def _is_insufficient_answer(sections: dict[str, str]) -> bool:
-    summary = sections.get("Summary", "").lower()
-    missing = sections.get("Uncertainties / Missing Evidence", "").lower()
-    return "insufficient" in summary or "insufficient" in missing or "no evidence" in missing
+def _contains_insufficient_markers(text: str) -> bool:
+    lower_text = text.lower()
+    return any(marker in lower_text for marker in _INSUFFICIENT_MARKERS)
+
+
+def _calibrate_confidence_tier(
+    *,
+    sections: dict[str, str],
+    evidence_count: int,
+    retrieval_mode: RetrievalMode,
+) -> ConfidenceTier:
+    if evidence_count <= 0:
+        return "insufficient_evidence"
+
+    summary = sections.get("Summary", "")
+    uncertainty = sections.get("Uncertainties / Missing Evidence", "")
+    if _contains_insufficient_markers(summary) or _contains_insufficient_markers(uncertainty):
+        return "insufficient_evidence"
+
+    merged_sections = "\n".join(sections.values())
+    citation_count = len(re.findall(r"\[chunk_id:\d+", merged_sections))
+
+    lower_uncertainty = uncertainty.lower()
+    has_limited_markers = any(
+        phrase in lower_uncertainty
+        for phrase in (
+            "limited",
+            "uncertain",
+            "missing",
+            "ambiguous",
+        )
+    )
+
+    if retrieval_mode == "broad_summary" and evidence_count < 3:
+        return "partial_limited_evidence"
+    if retrieval_mode != "meta_or_confidence" and citation_count == 0:
+        return "partial_limited_evidence"
+    if has_limited_markers and "none" not in lower_uncertainty:
+        return "partial_limited_evidence"
+
+    return "grounded"
 
 
 def _build_insufficient_sections(retrieval_mode: RetrievalMode) -> dict[str, str]:
     return {
-        "Summary": "Retrieved evidence is insufficient to answer this question reliably.",
-        "Key Points": "No supporting evidence was retrieved from transcript chunks.",
-        "Decisions": "No decision evidence was found in retrieved context.",
-        "Action Items": "No action-item evidence was found in retrieved context.",
+        "Summary": "Cannot answer confidently from retrieved evidence.",
+        "Key Points": (
+            "No supporting evidence was retrieved, or evidence is too limited or "
+            "overlapping for a reliable answer."
+        ),
+        "Decisions": "No clearly supported decision evidence was found.",
+        "Action Items": "No clearly supported action-item evidence was found.",
         "Uncertainties / Missing Evidence": (
-            "Try broadening the question, adding context, or increasing retrieval top-k. "
+            "Try broadening the question, asking for whole-meeting scope, or increasing adaptive "
+            "top-k. "
             f"Current retrieval mode: {retrieval_mode}."
         ),
     }
+
+
+def _is_speaker_topic_analysis_question(question: str) -> bool:
+    lower_question = question.lower()
+    if "speaker" not in lower_question and "who" not in lower_question:
+        return False
+    return any(
+        phrase in lower_question
+        for phrase in (
+            "which speaker talked the most",
+            "which speaker contributed most",
+            "who discussed",
+            "who talked most",
+            "which speaker discussed",
+            "contributed most to",
+        )
+    )
+
+
+def _extract_speakers_for_chunk(chunk: RetrievedChunk) -> list[str]:
+    labels: set[str] = set()
+    if chunk.speaker_label.strip():
+        labels.add(chunk.speaker_label.strip().upper())
+    labels.update(match.upper() for match in _SPEAKER_CONTENT_PATTERN.findall(chunk.content))
+    return sorted(labels)
+
+
+def _build_speaker_topic_sections(
+    *,
+    question: str,
+    evidence: Sequence[RetrievedChunk],
+) -> tuple[dict[str, str], ConfidenceTier, dict[str, dict[str, object]]]:
+    aggregates: dict[str, SpeakerEvidenceAggregate] = {}
+
+    for chunk in evidence:
+        speakers = _extract_speakers_for_chunk(chunk)
+        if not speakers:
+            continue
+
+        span_seconds = max(0.0, chunk.end_time - chunk.start_time)
+        span_share = span_seconds / max(1, len(speakers))
+
+        for speaker in speakers:
+            aggregate = aggregates.setdefault(speaker, SpeakerEvidenceAggregate())
+            aggregate.chunk_count += 1
+            aggregate.total_span_seconds += span_share
+            if chunk.chunk_id not in aggregate.chunk_ids:
+                aggregate.chunk_ids.append(chunk.chunk_id)
+
+    if not aggregates:
+        return _build_insufficient_sections("broad_summary"), "insufficient_evidence", {}
+
+    ordered = sorted(
+        aggregates.items(),
+        key=lambda item: (-item[1].chunk_count, -item[1].total_span_seconds, item[0]),
+    )
+    top_speaker, top_stats = ordered[0]
+    second_stats = ordered[1][1] if len(ordered) > 1 else None
+
+    confidence_tier: ConfidenceTier = "grounded"
+    ambiguity_note = ""
+    if second_stats is not None and top_stats.chunk_count == second_stats.chunk_count:
+        confidence_tier = "partial_limited_evidence"
+        ambiguity_note = (
+            " Top speaker margin is narrow, so the ranking should be treated as tentative."
+        )
+
+    summary = (
+        f"Based on retrieved evidence, {top_speaker} contributed the most to this topic."
+        if confidence_tier == "grounded"
+        else "Retrieved evidence suggests a likely top speaker, but the result is ambiguous."
+    )
+
+    top_rows: list[str] = []
+    for speaker, stats in ordered[:4]:
+        cited = ", ".join(f"chunk_id:{chunk_id}" for chunk_id in stats.chunk_ids[:3])
+        citation_note = f"e.g. {cited}" if cited else "no chunk IDs captured"
+        top_rows.append(
+            "- "
+            f"{speaker}: {stats.chunk_count} supporting chunks, "
+            f"~{stats.total_span_seconds:.1f}s evidence span; {citation_note}."
+        )
+
+    uncertainty = (
+        "Speaker ranking uses retrieved evidence coverage (chunk counts and span), not full "
+        "meeting ground truth."
+        f"{ambiguity_note}"
+    )
+
+    sections = {
+        "Summary": summary,
+        "Key Points": "\n".join(top_rows),
+        "Decisions": "Topical speaker ranking does not directly imply decision ownership.",
+        "Action Items": "Use a follow-up question for explicit action-item owners if needed.",
+        "Uncertainties / Missing Evidence": uncertainty,
+    }
+
+    stats_payload = {
+        speaker: {
+            "chunk_count": stats.chunk_count,
+            "total_span_seconds": round(stats.total_span_seconds, 3),
+            "chunk_ids": stats.chunk_ids[:],
+        }
+        for speaker, stats in ordered
+    }
+
+    return sections, confidence_tier, stats_payload
+
+
+def _cleanup_repetitive_bullets(sections: dict[str, str]) -> dict[str, str]:
+    updated = dict(sections)
+    for key in ("Summary", "Key Points"):
+        value = updated.get(key, "")
+        if not value.strip():
+            continue
+        updated[key] = _dedupe_bullet_text(value)
+    return updated
+
+
+def _dedupe_bullet_text(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet_lines = [line for line in lines if line.startswith("-")]
+    if len(bullet_lines) < 2:
+        return text
+
+    bullet_items = [line.lstrip("- ").strip() for line in bullet_lines]
+    deduped = _dedupe_bullet_candidates(bullet_items)
+    if not deduped:
+        return "- Unable to produce unique evidence-grounded bullets from retrieved evidence."
+    if len(deduped) == 1 and len(bullet_items) >= 3:
+        return "- Unable to produce unique evidence-grounded bullets from retrieved evidence."
+    return "\n".join(f"- {item}" for item in deduped)
+
+
+def _dedupe_bullet_candidates(candidates: Sequence[str]) -> list[str]:
+    deduped: list[str] = []
+    normalized_cache: list[set[str]] = []
+
+    for candidate in candidates:
+        normalized_candidate = " ".join(candidate.split())
+        if not normalized_candidate:
+            continue
+
+        candidate_tokens = _token_set(normalized_candidate)
+        if any(
+            _token_jaccard(candidate_tokens, existing_tokens) >= 0.86
+            for existing_tokens in normalized_cache
+        ):
+            continue
+
+        deduped.append(normalized_candidate)
+        normalized_cache.append(candidate_tokens)
+
+    return deduped
+
+
+def _token_set(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+
+
+def _token_jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    denominator = len(left.union(right))
+    if denominator == 0:
+        return 0.0
+    return len(left.intersection(right)) / denominator
 
 
 def _extract_format_directives(question: str) -> FormatDirectives:
@@ -450,31 +719,43 @@ def _summarize_recent_turn_confidence(
             0,
         )
 
-    reviewed_turns = recent_turns[-6:]
-    low_confidence_turns = [turn for turn in reviewed_turns if turn.insufficient_context]
+    reviewed_turns = recent_turns[-12:]
+    low_confidence_turns = [
+        turn
+        for turn in reviewed_turns
+        if turn.confidence_tier != "grounded" or turn.insufficient_context
+    ]
 
     mode_counts: dict[str, int] = {}
+    tier_counts: dict[str, int] = {}
     for turn in reviewed_turns:
         mode_counts[turn.retrieval_mode] = mode_counts.get(turn.retrieval_mode, 0) + 1
+        tier_counts[turn.confidence_tier] = tier_counts.get(turn.confidence_tier, 0) + 1
 
     mode_summary = ", ".join(
         f"{mode}:{count}" for mode, count in sorted(mode_counts.items(), key=lambda item: item[0])
     )
+    tier_summary = ", ".join(
+        f"{tier}:{count}" for tier, count in sorted(tier_counts.items(), key=lambda item: item[0])
+    )
     key_points = (
         f"Reviewed {len(reviewed_turns)} recent turns. "
         f"Low-confidence turns: {len(low_confidence_turns)}. "
-        f"Routing mix: {mode_summary or 'none'}."
+        f"Routing mix: {mode_summary or 'none'}. "
+        f"Confidence tiers: {tier_summary or 'none'}."
     )
 
     if not low_confidence_turns:
         return key_points, "No low-confidence turns were flagged in the recent conversation.", 0
 
-    low_confidence_questions = "; ".join(
-        turn.question for turn in low_confidence_turns[:3] if turn.question.strip()
+    low_confidence_questions = "; ".join(turn.question for turn in low_confidence_turns[:4])
+    uncertainty_notes = "; ".join(
+        turn.uncertainty_notes for turn in low_confidence_turns[:3] if turn.uncertainty_notes
     )
     uncertainty = (
         "Low-confidence recent questions: "
-        f"{low_confidence_questions or 'details unavailable from recent state.'}"
+        f"{low_confidence_questions or 'details unavailable from recent state.'}. "
+        f"Common uncertainty notes: {uncertainty_notes or 'not captured.'}"
     )
     return key_points, uncertainty, len(low_confidence_turns)
 
@@ -499,6 +780,7 @@ def _build_meta_answer_from_state(
             sections=sections,
             raw_answer=raw_answer,
             insufficient_context=True,
+            confidence_tier="insufficient_evidence",
         )
 
     evidence_preview = "No cached evidence was available from the previous turn."
@@ -552,16 +834,17 @@ def _build_meta_answer_from_state(
             ),
         }
         raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
+        confidence_tier: ConfidenceTier = (
+            "partial_limited_evidence" if low_confidence_count > 0 else "grounded"
+        )
         return GroundedAnswerResult(
             meeting_id=meeting_id,
             question=question,
             rewritten_query=rewritten_query,
             sections=sections,
             raw_answer=raw_answer,
-            insufficient_context=(
-                low_confidence_count > 0
-                or bool(latest_answer.insufficient_context if latest_answer is not None else False)
-            ),
+            insufficient_context=confidence_tier == "insufficient_evidence",
+            confidence_tier=confidence_tier,
         )
 
     latest_summary = (
@@ -595,13 +878,17 @@ def _build_meta_answer_from_state(
         ),
     }
     raw_answer = "\n".join(f"{key}: {value}" for key, value in sections.items())
+    confidence_tier = (
+        latest_answer.confidence_tier if latest_answer is not None else "partial_limited_evidence"
+    )
     return GroundedAnswerResult(
         meeting_id=meeting_id,
         question=question,
         rewritten_query=rewritten_query,
         sections=sections,
         raw_answer=raw_answer,
-        insufficient_context=bool(latest_answer.insufficient_context if latest_answer else False),
+        insufficient_context=confidence_tier == "insufficient_evidence",
+        confidence_tier=confidence_tier,
     )
 
 
@@ -631,9 +918,15 @@ def _apply_format_directives(
 
 
 def _as_bullets(text: str, bullet_count: int) -> str:
+    if bullet_count <= 0:
+        return "- Unable to produce unique evidence-grounded bullets from retrieved evidence."
+
     cleaned = " ".join(text.split())
     if not cleaned:
-        return "- No evidence available."
+        return (
+            f"- Unable to produce {bullet_count} unique evidence-grounded bullets "
+            "from retrieved evidence."
+        )
 
     raw_items = [
         item.strip(" -") for item in re.split(r"\n|;|(?<=[.!?])\s+", cleaned) if item.strip()
@@ -641,10 +934,14 @@ def _as_bullets(text: str, bullet_count: int) -> str:
     if not raw_items:
         raw_items = [cleaned]
 
-    if len(raw_items) < bullet_count:
-        raw_items.extend([raw_items[-1]] * (bullet_count - len(raw_items)))
+    deduped = _dedupe_bullet_candidates(raw_items)
+    if len(deduped) < bullet_count:
+        return (
+            f"- Unable to produce {bullet_count} unique evidence-grounded bullets "
+            "from retrieved evidence."
+        )
 
-    selected = raw_items[:bullet_count]
+    selected = deduped[:bullet_count]
     return "\n".join(f"- {item}" for item in selected)
 
 
@@ -677,6 +974,7 @@ def _with_answer_timing(
     metadata["cache"] = merged_cache
     metadata["compaction"] = compaction_metadata
     metadata["fast_mode"] = fast_mode
+    metadata["confidence_tier"] = result.confidence_tier
     return replace(result, service_metadata=metadata)
 
 

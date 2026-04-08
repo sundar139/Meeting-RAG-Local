@@ -47,8 +47,20 @@ uv run python scripts/run_migrations.py
 ```bash
 ollama serve
 ollama pull nomic-embed-text-v2-moe
-ollama pull llama3.2:3b-instruct
+ollama pull qwen3:4b
 ```
+
+## Retrieval Chunking Settings
+
+Set these in `.env` (or keep defaults):
+
+```bash
+RETRIEVAL_CHUNK_WINDOW_SECONDS=45
+RETRIEVAL_CHUNK_OVERLAP_SECONDS=15
+```
+
+If you change these values for existing meetings, rerun ingestion with replacement so stored
+embeddings are rebuilt with the new retrieval chunk windows.
 
 ## Verification Checklist
 

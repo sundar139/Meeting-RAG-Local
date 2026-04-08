@@ -115,6 +115,18 @@ def test_query_rewriter_detects_confidence_meta_question_without_model_call() ->
     assert client.call_count == 0
 
 
+def test_query_rewriter_detects_session_meta_question_without_model_call() -> None:
+    client = FakeChatClient("unused")
+    rewriter = QueryRewriter(client=client, model_name="llama-test")
+
+    result = rewriter.rewrite("What could not be answered confidently in this chat?")
+
+    assert result.question_relation == "meta_chat_scope"
+    assert result.used_fallback is True
+    assert result.fallback_reason == "meta_question"
+    assert client.call_count == 0
+
+
 def test_query_rewriter_rejects_empty_question() -> None:
     rewriter = QueryRewriter(client=FakeChatClient("ok"), model_name="llama-test")
 

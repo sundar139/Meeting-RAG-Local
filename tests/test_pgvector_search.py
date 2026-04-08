@@ -53,7 +53,7 @@ def test_search_similar_chunks_executes_expected_query_and_maps_results() -> Non
     cursor = RecordingCursor(
         executed=[],
         fetchall_result=[
-            (1, "m1", "spk_0", 0.0, 1.0, "hello", 0.95),
+            (1, "m1", "spk_0", 0.0, 1.0, "hello", "chunk-a", 0.95),
         ],
     )
     searcher = PgVectorSearcher(RecordingConnection(cursor))
@@ -63,6 +63,7 @@ def test_search_similar_chunks_executes_expected_query_and_maps_results() -> Non
 
     assert len(results) == 1
     assert results[0].chunk_id == 1
+    assert results[0].chunk_key == "chunk-a"
     assert results[0].similarity == 0.95
 
     assert len(cursor.executed) == 1
@@ -80,7 +81,7 @@ def test_search_similar_chunks_can_apply_db_side_speaker_filter() -> None:
     cursor = RecordingCursor(
         executed=[],
         fetchall_result=[
-            (1, "m1", "SPEAKER_00", 0.0, 1.0, "hello", 0.95),
+            (1, "m1", "SPEAKER_00", 0.0, 1.0, "hello", "chunk-b", 0.95),
         ],
     )
     searcher = PgVectorSearcher(RecordingConnection(cursor))

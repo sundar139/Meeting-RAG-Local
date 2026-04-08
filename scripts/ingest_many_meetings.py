@@ -125,6 +125,8 @@ def ingest_many_meetings(
     batch_size: int,
     dry_run: bool,
     discovery_source: DiscoverySource = "both",
+    retrieval_chunk_window_seconds: float | None = None,
+    retrieval_chunk_overlap_seconds: float | None = None,
 ) -> dict[str, int]:
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
@@ -180,13 +182,19 @@ def ingest_many_meetings(
                 )
 
         try:
-            ingest_embeddings(
-                meeting_id=meeting_id,
-                turns_path=turns_path,
-                replace_existing=replace_existing,
-                batch_size=batch_size,
-                dry_run=dry_run,
-            )
+            ingest_kwargs: dict[str, object] = {
+                "meeting_id": meeting_id,
+                "turns_path": turns_path,
+                "replace_existing": replace_existing,
+                "batch_size": batch_size,
+                "dry_run": dry_run,
+            }
+            if retrieval_chunk_window_seconds is not None:
+                ingest_kwargs["retrieval_chunk_window_seconds"] = retrieval_chunk_window_seconds
+            if retrieval_chunk_overlap_seconds is not None:
+                ingest_kwargs["retrieval_chunk_overlap_seconds"] = retrieval_chunk_overlap_seconds
+
+            ingest_embeddings(**ingest_kwargs)
             ingested += 1
             LOGGER.info("Ingested meeting_id=%s", meeting_id)
         except Exception as exc:
@@ -236,6 +244,14 @@ def main(
     batch_size: int = typer.Option(16, "--batch-size"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     discovery_source: DiscoverySource = typer.Option("both", "--discovery-source"),
+    retrieval_chunk_window_seconds: float | None = typer.Option(
+        None,
+        "--retrieval-chunk-window-seconds",
+    ),
+    retrieval_chunk_overlap_seconds: float | None = typer.Option(
+        None,
+        "--retrieval-chunk-overlap-seconds",
+    ),
 ) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -252,6 +268,8 @@ def main(
         batch_size=batch_size,
         dry_run=dry_run,
         discovery_source=discovery_source,
+        retrieval_chunk_window_seconds=retrieval_chunk_window_seconds,
+        retrieval_chunk_overlap_seconds=retrieval_chunk_overlap_seconds,
     )
 
     LOGGER.info("processed=%d", summary["processed"])

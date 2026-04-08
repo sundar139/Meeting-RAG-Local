@@ -26,6 +26,7 @@ class SimilarChunkResult:
     end_time: float
     content: str
     similarity: float
+    chunk_key: str | None = None
 
 
 class CursorProtocol(Protocol):
@@ -93,7 +94,7 @@ def _coerce_float(value: object, *, field_name: str) -> float:
 
 class PgVectorSearcher:
     _SEARCH_SQL = (
-        "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, "
+        "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, chunk_key, "
         "(1 - (embedding <=> %s::vector)) AS similarity "
         "FROM meeting_transcripts "
         "WHERE meeting_id = %s AND embedding IS NOT NULL "
@@ -101,7 +102,7 @@ class PgVectorSearcher:
         "LIMIT %s"
     )
     _SEARCH_SQL_WITH_SPEAKER = (
-        "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, "
+        "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, chunk_key, "
         "(1 - (embedding <=> %s::vector)) AS similarity "
         "FROM meeting_transcripts "
         "WHERE meeting_id = %s AND speaker_label = %s AND embedding IS NOT NULL "
@@ -156,7 +157,8 @@ class PgVectorSearcher:
                 start_time=_coerce_float(row[3], field_name="start_time"),
                 end_time=_coerce_float(row[4], field_name="end_time"),
                 content=str(row[5]),
-                similarity=_coerce_float(row[6], field_name="similarity"),
+                chunk_key=str(row[6]) if row[6] is not None else None,
+                similarity=_coerce_float(row[7], field_name="similarity"),
             )
             for row in rows
         ]

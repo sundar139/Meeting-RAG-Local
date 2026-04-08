@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     broad_summary_top_k: int = Field(default=14, ge=1)
     meta_or_confidence_top_k: int = Field(default=6, ge=1)
     broad_summary_max_candidates: int = Field(default=28, ge=1)
+    retrieval_chunk_window_seconds: float = Field(default=45.0, ge=20.0, le=120.0)
+    retrieval_chunk_overlap_seconds: float = Field(default=15.0, ge=0.0, le=60.0)
 
     enable_rag_caching: bool = True
     query_rewrite_cache_size: int = Field(default=256, ge=1)
@@ -79,6 +81,15 @@ class Settings(BaseSettings):
             f"postgresql://{self.postgres_user}:{password}@"
             f"{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @model_validator(mode="after")
+    def _validate_retrieval_chunking(self) -> Settings:
+        if self.retrieval_chunk_overlap_seconds >= self.retrieval_chunk_window_seconds:
+            raise ValueError(
+                "retrieval_chunk_overlap_seconds must be less than "
+                "retrieval_chunk_window_seconds"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

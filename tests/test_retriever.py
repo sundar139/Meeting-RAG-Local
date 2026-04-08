@@ -442,6 +442,95 @@ def test_retriever_routes_broad_topic_questions_to_broad_summary() -> None:
     assert searcher.last_top_k > bundle.top_k_used
 
 
+def test_retriever_routes_speaker_topic_comparison_to_broad_summary() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(
+            rewritten_query="Which speaker talked the most about planning or decision-making?"
+        ),
+        embedder=FakeEmbedder(),
+    )
+
+    bundle = retriever.retrieve(
+        meeting_id="m1",
+        user_query="Which speaker talked the most about planning or decision-making?",
+    )
+
+    assert bundle.retrieval_mode == "broad_summary"
+
+
+def test_retriever_broad_summary_dedupes_overlapping_duplicate_chunks() -> None:
+    class DuplicateHeavySearcher(FakeSearcher):
+        def search_similar_chunks(
+            self,
+            meeting_id: str,
+            query_embedding: list[float],
+            top_k: int = 10,
+            speaker_label: str | None = None,
+        ) -> list[SimilarChunkResult]:
+            _ = query_embedding
+            _ = top_k
+            _ = speaker_label
+            return [
+                SimilarChunkResult(
+                    chunk_id=1,
+                    meeting_id=meeting_id,
+                    speaker_label="SPEAKER_00",
+                    start_time=0.0,
+                    end_time=40.0,
+                    content="Window planning and launch decisions",
+                    similarity=0.95,
+                    chunk_key="chunk-a",
+                ),
+                SimilarChunkResult(
+                    chunk_id=2,
+                    meeting_id=meeting_id,
+                    speaker_label="SPEAKER_00",
+                    start_time=0.0,
+                    end_time=40.0,
+                    content="Window planning and launch decisions",
+                    similarity=0.94,
+                    chunk_key="chunk-a",
+                ),
+                SimilarChunkResult(
+                    chunk_id=3,
+                    meeting_id=meeting_id,
+                    speaker_label="SPEAKER_00",
+                    start_time=5.0,
+                    end_time=45.0,
+                    content="Window planning and launch decisions",
+                    similarity=0.93,
+                    chunk_key="chunk-b",
+                ),
+                SimilarChunkResult(
+                    chunk_id=4,
+                    meeting_id=meeting_id,
+                    speaker_label="SPEAKER_01",
+                    start_time=120.0,
+                    end_time=150.0,
+                    content="Risk discussion and mitigation planning",
+                    similarity=0.91,
+                    chunk_key="chunk-c",
+                ),
+            ]
+
+    retriever = Retriever(
+        searcher=DuplicateHeavySearcher(),
+        query_rewriter=FakeRewriter(rewritten_query="Summarize the whole meeting"),
+        embedder=FakeEmbedder(),
+    )
+
+    bundle = retriever.retrieve(
+        meeting_id="m1",
+        user_query="Summarize the whole meeting",
+        top_k=3,
+    )
+
+    assert bundle.retrieval_mode == "broad_summary"
+    assert [item.chunk_id for item in bundle.results] == [1, 4]
+
+
 def test_retriever_routes_disagreement_questions_to_broad_summary() -> None:
     searcher = FakeSearcher()
     retriever = Retriever(

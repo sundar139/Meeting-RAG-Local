@@ -41,6 +41,15 @@ def render_warning(message: str, *, hint: str | None = None) -> None:
     st.warning(message)
 
 
+def render_info(message: str, *, hint: str | None = None) -> None:
+    import streamlit as st
+
+    if hint:
+        st.info(f"{message}\n\n{hint}")
+        return
+    st.info(message)
+
+
 def render_empty_state(title: str, body: str) -> None:
     import streamlit as st
 
@@ -208,13 +217,25 @@ def render_response_diagnostics(
     top_k_used: int,
     used_cached_context: bool,
     insufficient_context: bool,
+    confidence_tier: str | None = None,
     service_metadata: Mapping[str, object] | None = None,
     show_latency: bool = False,
 ) -> None:
     import streamlit as st
 
-    confidence_text = "Low" if insufficient_context else "Grounded"
-    confidence_tone = "warn" if insufficient_context else "good"
+    normalized_tier = (confidence_tier or "").strip().lower()
+    if not normalized_tier:
+        normalized_tier = "insufficient_evidence" if insufficient_context else "grounded"
+
+    if normalized_tier == "insufficient_evidence":
+        confidence_text = "Insufficient evidence"
+        confidence_tone = "warn"
+    elif normalized_tier == "partial_limited_evidence":
+        confidence_text = "Partial / limited"
+        confidence_tone = "info"
+    else:
+        confidence_text = "Grounded"
+        confidence_tone = "good"
 
     badges = [
         _badge("Mode", retrieval_mode.replace("_", " "), tone="info"),
@@ -265,13 +286,18 @@ def render_response_diagnostics(
 def render_answer_sections(answer: GroundedAnswerResult) -> None:
     import streamlit as st
 
-    if answer.insufficient_context:
+    if answer.confidence_tier == "insufficient_evidence" or answer.insufficient_context:
         render_warning(
-            "Low confidence: supporting evidence is limited for this answer.",
+            "Cannot answer confidently from retrieved evidence.",
             hint=(
                 "Try a broader question, ask for a whole-meeting summary, "
                 "or increase adaptive top-k."
             ),
+        )
+    elif answer.confidence_tier == "partial_limited_evidence":
+        render_info(
+            "Answer is partially grounded with limited evidence coverage.",
+            hint="Treat this as directional and ask a narrower follow-up if needed.",
         )
 
     section_order = [

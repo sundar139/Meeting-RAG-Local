@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -21,6 +22,7 @@ from meeting_pipeline.timing import elapsed_ms, now
 
 LOGGER = logging.getLogger(__name__)
 _SPEAKER_TOKEN_PATTERN = re.compile(r"\bSPEAKER_\d+\b", re.IGNORECASE)
+_SPEAKER_BRACKET_PATTERN = re.compile(r"\[(SPEAKER_\d+)\s", re.IGNORECASE)
 
 RetrievalCacheKey = tuple[str, str, int, RetrievalMode, str | None]
 
@@ -43,6 +45,11 @@ def _is_meta_confidence_question(text: str) -> bool:
             "supported by evidence",
             "which of these answers",
             "conversation so far",
+            "which of my questions",
+            "which questions were low confidence",
+            "what could not be answered confidently",
+            "across these answers",
+            "in this chat",
         )
     )
 
@@ -84,6 +91,56 @@ def _is_broad_summary_question(text: str) -> bool:
     ) or _is_whole_meeting_scope(lower_text)
 
 
+def _is_speaker_topic_comparison_question(text: str) -> bool:
+    lower_text = text.lower()
+    if "speaker" not in lower_text and "who" not in lower_text:
+        return False
+    return any(
+        phrase in lower_text
+        for phrase in (
+            "which speaker talked the most",
+            "which speaker contributed most",
+            "who discussed",
+            "who talked most",
+            "which speaker discussed",
+            "contributed most to",
+        )
+    )
+
+
+def _token_set_for_similarity(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]{3,}", text.lower()))
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = len(left.intersection(right))
+    union = len(left.union(right))
+    if union == 0:
+        return 0.0
+    return intersection / union
+
+
+def _time_overlap_ratio(first: SimilarChunkResult, second: SimilarChunkResult) -> float:
+    overlap = max(
+        0.0,
+        min(first.end_time, second.end_time) - max(first.start_time, second.start_time),
+    )
+    first_span = max(0.0, first.end_time - first.start_time)
+    second_span = max(0.0, second.end_time - second.start_time)
+    baseline = max(0.001, min(first_span, second_span))
+    return overlap / baseline
+
+
+def _extract_speaker_labels(result: SimilarChunkResult) -> set[str]:
+    labels: set[str] = set()
+    if result.speaker_label.strip():
+        labels.add(result.speaker_label.strip().upper())
+    labels.update(match.upper() for match in _SPEAKER_BRACKET_PATTERN.findall(result.content))
+    return labels
+
+
 def _infer_meta_scope(text: str) -> str:
     lower_text = text.lower()
     if any(
@@ -95,6 +152,9 @@ def _infer_meta_scope(text: str) -> str:
             "conversation so far",
             "broader recent conversation",
             "overall confidence",
+            "across these answers",
+            "in this chat",
+            "which of my questions",
         )
     ):
         return "recent_conversation"
@@ -262,6 +322,9 @@ class Retriever:
         if _SPEAKER_TOKEN_PATTERN.search(user_query) or "specific speaker" in lower_query:
             return "speaker_specific"
 
+        if _is_speaker_topic_comparison_question(lower_query):
+            return "broad_summary"
+
         if _is_broad_summary_question(lower_query):
             return "broad_summary"
 
@@ -330,45 +393,86 @@ class Retriever:
         results: list[SimilarChunkResult],
         final_top_k: int,
     ) -> list[SimilarChunkResult]:
-        if len(results) <= final_top_k:
-            return results
+        if not results:
+            return []
+
+        deduped = self._dedupe_overlapping_results(results)
+        if len(deduped) <= final_top_k:
+            return deduped
 
         selected: list[SimilarChunkResult] = []
         selected_ids: set[int] = set()
         seen_speakers: set[str] = set()
+        seen_windows: set[int] = set()
 
-        # First pass: maximize speaker diversity.
-        for result in results:
-            speaker = (result.speaker_label or "").strip().upper()
-            if speaker and speaker not in seen_speakers:
-                selected.append(result)
-                selected_ids.add(result.chunk_id)
-                seen_speakers.add(speaker)
-            if len(selected) >= final_top_k:
-                return selected
-
-        # Second pass: maximize temporal spread in 2-minute windows.
-        seen_windows: set[int] = set(int(item.start_time // 120) for item in selected)
-        for result in results:
-            if result.chunk_id in selected_ids:
-                continue
-            time_window = int(result.start_time // 120)
+        # First pass: maximize temporal spread across 3-minute windows.
+        for result in deduped:
+            time_window = int(result.start_time // 180)
             if time_window in seen_windows:
                 continue
             selected.append(result)
             selected_ids.add(result.chunk_id)
             seen_windows.add(time_window)
+            seen_speakers.update(_extract_speaker_labels(result))
             if len(selected) >= final_top_k:
                 return selected
 
-        for result in results:
+        # Second pass: improve speaker diversity while preserving chronology spread.
+        for result in deduped:
+            if result.chunk_id in selected_ids:
+                continue
+            candidate_speakers = _extract_speaker_labels(result)
+            if candidate_speakers and candidate_speakers.issubset(seen_speakers):
+                continue
+            selected.append(result)
+            selected_ids.add(result.chunk_id)
+            seen_speakers.update(candidate_speakers)
+            if len(selected) >= final_top_k:
+                return selected
+
+        # Final pass: fill by retrieval ranking.
+        for result in deduped:
             if result.chunk_id in selected_ids:
                 continue
             selected.append(result)
             if len(selected) >= final_top_k:
-                break
+                return selected
 
         return selected
+
+    def _dedupe_overlapping_results(
+        self,
+        results: Iterable[SimilarChunkResult],
+    ) -> list[SimilarChunkResult]:
+        deduped: list[SimilarChunkResult] = []
+        for candidate in results:
+            if any(self._is_near_duplicate(candidate, existing) for existing in deduped):
+                continue
+            deduped.append(candidate)
+        return deduped
+
+    def _is_near_duplicate(
+        self,
+        first: SimilarChunkResult,
+        second: SimilarChunkResult,
+    ) -> bool:
+        if first.chunk_key and second.chunk_key and first.chunk_key == second.chunk_key:
+            return True
+
+        first_content = " ".join(first.content.lower().split())
+        second_content = " ".join(second.content.lower().split())
+        if first_content == second_content:
+            return True
+
+        overlap_ratio = _time_overlap_ratio(first, second)
+        if overlap_ratio < 0.7:
+            return False
+
+        similarity = _jaccard_similarity(
+            _token_set_for_similarity(first_content),
+            _token_set_for_similarity(second_content),
+        )
+        return similarity >= 0.72
 
     def retrieve(
         self,
@@ -567,7 +671,7 @@ class Retriever:
             search_results = [
                 result
                 for result in search_results
-                if (result.speaker_label or "").strip().upper() == speaker_filter
+                if speaker_filter in _extract_speaker_labels(result)
             ]
 
         if retrieval_mode == "broad_summary":
@@ -586,6 +690,7 @@ class Retriever:
                 end_time=result.end_time,
                 content=result.content,
                 similarity=result.similarity,
+                chunk_key=result.chunk_key,
             )
             for result in search_results
         ]

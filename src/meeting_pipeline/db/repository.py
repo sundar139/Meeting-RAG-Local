@@ -16,6 +16,7 @@ class TranscriptChunkInsert:
     end_time: float
     content: str
     embedding: list[float] | None = None
+    chunk_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class TranscriptChunk:
     start_time: float
     end_time: float
     content: str
+    chunk_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,18 @@ def _validate_embedding(embedding: list[float] | None) -> list[float] | None:
     return cleaned
 
 
+def _validate_chunk_key(chunk_key: str | None) -> str | None:
+    if chunk_key is None:
+        return None
+
+    normalized = chunk_key.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 80:
+        raise ValueError("chunk_key cannot exceed 80 characters")
+    return normalized
+
+
 def _to_pgvector_literal(embedding: list[float] | None) -> str | None:
     if embedding is None:
         return None
@@ -137,14 +151,16 @@ def _coerce_optional_float(value: object | None, *, field_name: str) -> float | 
 class TranscriptChunkRepository:
     _INSERT_ONE_SQL = (
         "INSERT INTO meeting_transcripts "
-        "(meeting_id, speaker_label, start_time, end_time, content, embedding) "
-        "VALUES (%s, %s, %s, %s, %s, %s::vector) "
+        "(meeting_id, speaker_label, start_time, end_time, content, embedding, chunk_key) "
+        "VALUES (%s, %s, %s, %s, %s, %s::vector, %s) "
+        "ON CONFLICT (meeting_id, chunk_key) DO UPDATE SET chunk_key = EXCLUDED.chunk_key "
         "RETURNING chunk_id"
     )
     _INSERT_BATCH_SQL = (
         "INSERT INTO meeting_transcripts "
-        "(meeting_id, speaker_label, start_time, end_time, content, embedding) "
-        "VALUES (%s, %s, %s, %s, %s, %s::vector)"
+        "(meeting_id, speaker_label, start_time, end_time, content, embedding, chunk_key) "
+        "VALUES (%s, %s, %s, %s, %s, %s::vector, %s) "
+        "ON CONFLICT (meeting_id, chunk_key) DO NOTHING"
     )
 
     def __init__(self, connection: ConnectionProtocol) -> None:
@@ -158,6 +174,7 @@ class TranscriptChunkRepository:
         end_time: float,
         content: str,
         embedding: list[float] | None = None,
+        chunk_key: str | None = None,
     ) -> int:
         validated_meeting_id = _require_non_empty(
             meeting_id, field_name="meeting_id", max_length=255
@@ -168,6 +185,7 @@ class TranscriptChunkRepository:
         validated_content = _require_non_empty(content, field_name="content")
         validated_start, validated_end = _validate_time_bounds(start_time, end_time)
         validated_embedding = _validate_embedding(embedding)
+        validated_chunk_key = _validate_chunk_key(chunk_key)
 
         try:
             with self._connection.cursor() as cursor:
@@ -180,6 +198,7 @@ class TranscriptChunkRepository:
                         validated_end,
                         validated_content,
                         _to_pgvector_literal(validated_embedding),
+                        validated_chunk_key,
                     ),
                 )
                 row = cursor.fetchone()
@@ -283,6 +302,7 @@ class TranscriptChunkRepository:
             validated_content = _require_non_empty(chunk.content, field_name="content")
             validated_start, validated_end = _validate_time_bounds(chunk.start_time, chunk.end_time)
             validated_embedding = _validate_embedding(chunk.embedding)
+            validated_chunk_key = _validate_chunk_key(chunk.chunk_key)
 
             values.append(
                 (
@@ -292,14 +312,16 @@ class TranscriptChunkRepository:
                     validated_end,
                     validated_content,
                     _to_pgvector_literal(validated_embedding),
+                    validated_chunk_key,
                 )
             )
 
         try:
             with self._connection.cursor() as cursor:
                 cursor.executemany(self._INSERT_BATCH_SQL, values)
+                inserted = max(0, int(cursor.rowcount))
             self._connection.commit()
-            return len(values)
+            return inserted
         except Exception as exc:
             self._connection.rollback()
             raise RuntimeError("Failed to insert transcript chunk batch") from exc
@@ -317,7 +339,7 @@ class TranscriptChunkRepository:
             raise ValueError("limit must be a positive integer when provided")
 
         base_sql = (
-            "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content "
+            "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, chunk_key "
             "FROM meeting_transcripts WHERE meeting_id = %s "
             "ORDER BY start_time ASC, chunk_id ASC"
         )
@@ -341,6 +363,7 @@ class TranscriptChunkRepository:
                 start_time=_coerce_float(row[3], field_name="start_time"),
                 end_time=_coerce_float(row[4], field_name="end_time"),
                 content=str(row[5]),
+                chunk_key=str(row[6]) if row[6] is not None else None,
             )
             for row in rows
         ]
