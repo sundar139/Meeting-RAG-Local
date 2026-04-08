@@ -74,3 +74,27 @@ def test_search_similar_chunks_executes_expected_query_and_maps_results() -> Non
     assert isinstance(params[0], str)
     assert params[0].startswith("[")
     assert params[0].endswith("]")
+
+
+def test_search_similar_chunks_can_apply_db_side_speaker_filter() -> None:
+    cursor = RecordingCursor(
+        executed=[],
+        fetchall_result=[
+            (1, "m1", "SPEAKER_00", 0.0, 1.0, "hello", 0.95),
+        ],
+    )
+    searcher = PgVectorSearcher(RecordingConnection(cursor))
+
+    results = searcher.search_similar_chunks(
+        meeting_id="m1",
+        query_embedding=[0.2] * 768,
+        top_k=2,
+        speaker_label="SPEAKER_00",
+    )
+
+    assert len(results) == 1
+    assert len(cursor.executed) == 1
+    query, params = cursor.executed[0]
+    assert "speaker_label = %s" in query
+    assert params is not None
+    assert params[2] == "SPEAKER_00"

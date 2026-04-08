@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+from meeting_pipeline.cache_utils import LruCache
 from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClient
 
@@ -22,24 +23,42 @@ class Embedder:
         self._client = client or OllamaClient.from_settings(runtime_settings)
         configured_model = (model_name or runtime_settings.ollama_model).strip()
         self._model_name = configured_model or DEFAULT_EMBEDDING_MODEL
+        self._cache_enabled = runtime_settings.enable_rag_caching
+        self._query_cache = LruCache[tuple[str, str], list[float]](
+            runtime_settings.query_embedding_cache_size
+        )
+        self.last_cache_hit = False
 
     @property
     def model_name(self) -> str:
         return self._model_name
 
-    def embed_document(self, text: str) -> list[float]:
-        return self._embed_prefixed(DOCUMENT_PREFIX, text)
+    def embed_document(self, text: str, *, use_cache: bool = True) -> list[float]:
+        return self._embed_prefixed(DOCUMENT_PREFIX, text, use_cache=use_cache)
 
-    def embed_query(self, text: str) -> list[float]:
-        return self._embed_prefixed(QUERY_PREFIX, text)
+    def embed_query(self, text: str, *, use_cache: bool = True) -> list[float]:
+        return self._embed_prefixed(QUERY_PREFIX, text, use_cache=use_cache)
 
-    def _embed_prefixed(self, prefix: str, text: str) -> list[float]:
+    def _embed_prefixed(self, prefix: str, text: str, *, use_cache: bool = True) -> list[float]:
         normalized = " ".join(text.split())
         if not normalized:
             raise ValueError("text must be a non-empty string")
 
+        cache_key = (prefix, normalized)
+        should_use_cache = use_cache and self._cache_enabled
+        if should_use_cache:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                self.last_cache_hit = True
+                return cached
+
+        self.last_cache_hit = False
+
         embedding = self._client.embed(model=self._model_name, text=f"{prefix}{normalized}")
-        return _validate_embedding(embedding)
+        validated = _validate_embedding(embedding)
+        if should_use_cache:
+            self._query_cache.set(cache_key, validated)
+        return validated
 
 
 def _validate_embedding(values: list[float]) -> list[float]:

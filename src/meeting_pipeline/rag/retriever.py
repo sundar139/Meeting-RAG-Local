@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
+from meeting_pipeline.cache_utils import LruCache
 from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.db.pgvector_search import SimilarChunkResult
 from meeting_pipeline.embeddings.embedder import Embedder
@@ -20,6 +21,8 @@ from meeting_pipeline.timing import elapsed_ms, now
 
 LOGGER = logging.getLogger(__name__)
 _SPEAKER_TOKEN_PATTERN = re.compile(r"\bSPEAKER_\d+\b", re.IGNORECASE)
+
+RetrievalCacheKey = tuple[str, str, int, RetrievalMode, str | None]
 
 
 @dataclass(frozen=True)
@@ -51,16 +54,25 @@ class QueryRewriterProtocol(Protocol):
         self,
         latest_user_question: str,
         conversation_context: list[str] | None = None,
+        *,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> QueryRewriteResult: ...
 
 
 class QueryEmbedderProtocol(Protocol):
-    def embed_query(self, text: str) -> list[float]: ...
+    last_cache_hit: bool
+
+    def embed_query(self, text: str, *, use_cache: bool = True) -> list[float]: ...
 
 
 class VectorSearcherProtocol(Protocol):
     def search_similar_chunks(
-        self, meeting_id: str, query_embedding: list[float], top_k: int = 10
+        self,
+        meeting_id: str,
+        query_embedding: list[float],
+        top_k: int = 10,
+        speaker_label: str | None = None,
     ) -> list[SimilarChunkResult]: ...
 
 
@@ -73,12 +85,91 @@ class Retriever:
         embedder: QueryEmbedderProtocol | None = None,
         policy: RetrievalPolicy | None = None,
         settings: Settings | None = None,
+        retrieval_cache: LruCache[RetrievalCacheKey, RetrievalBundle] | None = None,
     ) -> None:
         runtime_settings = settings or get_settings()
         self._searcher = searcher
         self._query_rewriter = query_rewriter or QueryRewriter()
         self._embedder = embedder or Embedder()
         self._policy = policy or RetrievalPolicy.from_settings(runtime_settings)
+        self._cache_enabled = runtime_settings.enable_rag_caching
+        self._fast_mode_top_k_cap = runtime_settings.fast_mode_policy_top_k_cap
+        self._retrieval_cache = retrieval_cache or LruCache[RetrievalCacheKey, RetrievalBundle](
+            runtime_settings.retrieval_bundle_cache_size
+        )
+
+    def _search_similar_chunks(
+        self,
+        *,
+        meeting_id: str,
+        query_embedding: list[float],
+        top_k: int,
+        speaker_filter: str | None,
+        use_db_speaker_filter: bool,
+    ) -> tuple[list[SimilarChunkResult], bool]:
+        if use_db_speaker_filter:
+            try:
+                return (
+                    self._searcher.search_similar_chunks(
+                        meeting_id=meeting_id,
+                        query_embedding=query_embedding,
+                        top_k=top_k,
+                        speaker_label=speaker_filter,
+                    ),
+                    True,
+                )
+            except TypeError:
+                # Backward compatibility for test doubles that do not accept speaker_label.
+                pass
+
+        return (
+            self._searcher.search_similar_chunks(
+                meeting_id=meeting_id,
+                query_embedding=query_embedding,
+                top_k=top_k,
+            ),
+            False,
+        )
+
+    def _embed_query(self, text: str, *, use_cache: bool) -> list[float]:
+        try:
+            return self._embedder.embed_query(text, use_cache=use_cache)
+        except TypeError:
+            # Backward compatibility for test doubles that do not accept use_cache.
+            return self._embedder.embed_query(text)
+
+    def _rewrite_query(
+        self,
+        *,
+        latest_user_question: str,
+        conversation_context: list[str] | None,
+        use_cache: bool,
+        fast_mode: bool,
+    ) -> QueryRewriteResult:
+        try:
+            return self._query_rewriter.rewrite(
+                latest_user_question=latest_user_question,
+                conversation_context=conversation_context,
+                use_cache=use_cache,
+                fast_mode=fast_mode,
+            )
+        except TypeError:
+            # Backward compatibility for test doubles that do not accept cache/fast-mode kwargs.
+            return self._query_rewriter.rewrite(
+                latest_user_question=latest_user_question,
+                conversation_context=conversation_context,
+            )
+
+    def _retrieval_cache_key(
+        self,
+        *,
+        meeting_id: str,
+        rewritten_query: str,
+        top_k: int,
+        retrieval_mode: RetrievalMode,
+        speaker_filter: str | None,
+    ) -> RetrievalCacheKey:
+        return (meeting_id, rewritten_query, top_k, retrieval_mode, speaker_filter)
 
     def _classify_retrieval_mode(
         self,
@@ -204,6 +295,8 @@ class Retriever:
         conversation_context: list[str] | None = None,
         top_k: int | None = None,
         conversation_state: ConversationState | None = None,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> RetrievalBundle:
         request_started_at = now()
         normalized_meeting_id = meeting_id.strip()
@@ -217,9 +310,11 @@ class Retriever:
             raise ValueError("top_k must be a positive integer")
 
         rewrite_started_at = now()
-        rewrite_result = self._query_rewriter.rewrite(
+        rewrite_result = self._rewrite_query(
             latest_user_question=normalized_query,
             conversation_context=conversation_context,
+            use_cache=use_cache,
+            fast_mode=fast_mode,
         )
         rewrite_elapsed_ms = elapsed_ms(rewrite_started_at)
 
@@ -227,6 +322,17 @@ class Retriever:
         speaker_filter = self._extract_speaker_filter(rewrite_result.rewritten_query)
         policy_top_k = self._top_k_for_mode(retrieval_mode)
         final_top_k = top_k or policy_top_k
+        if fast_mode and top_k is None:
+            final_top_k = min(final_top_k, self._fast_mode_top_k_cap)
+
+        should_use_cache = use_cache and self._cache_enabled
+        retrieval_cache_key = self._retrieval_cache_key(
+            meeting_id=normalized_meeting_id,
+            rewritten_query=rewrite_result.rewritten_query,
+            top_k=final_top_k,
+            retrieval_mode=retrieval_mode,
+            speaker_filter=speaker_filter if retrieval_mode == "speaker_specific" else None,
+        )
 
         if (
             retrieval_mode == "meta_or_confidence"
@@ -244,7 +350,9 @@ class Retriever:
             )
             timings_ms = {
                 "query_rewrite": rewrite_elapsed_ms,
+                "query_embedding": 0.0,
                 "embedding_query_prep": 0.0,
+                "postgres_retrieval": 0.0,
                 "retrieval": 0.0,
                 "retrieval_total": elapsed_ms(request_started_at),
             }
@@ -258,8 +366,43 @@ class Retriever:
                 question_relation=rewrite_result.question_relation,
                 used_cached_context=True,
                 speaker_filter=speaker_filter,
-                service_metadata={"timings_ms": timings_ms},
+                service_metadata={
+                    "timings_ms": timings_ms,
+                    "cache": {
+                        "query_rewrite": rewrite_result.used_cache,
+                        "query_embedding": False,
+                        "retrieval_bundle": False,
+                    },
+                    "fast_mode": fast_mode,
+                },
             )
+
+        if should_use_cache:
+            cached_bundle = self._retrieval_cache.get(retrieval_cache_key)
+            if cached_bundle is not None:
+                timings_ms = {
+                    "query_rewrite": rewrite_elapsed_ms,
+                    "query_embedding": 0.0,
+                    "embedding_query_prep": 0.0,
+                    "postgres_retrieval": 0.0,
+                    "retrieval": 0.0,
+                    "retrieval_total": elapsed_ms(request_started_at),
+                }
+                metadata = {
+                    "timings_ms": timings_ms,
+                    "cache": {
+                        "query_rewrite": rewrite_result.used_cache,
+                        "query_embedding": False,
+                        "retrieval_bundle": True,
+                    },
+                    "fast_mode": fast_mode,
+                }
+                return replace(
+                    cached_bundle,
+                    user_query=normalized_query,
+                    top_k_used=final_top_k,
+                    service_metadata=metadata,
+                )
 
         LOGGER.info(
             "retrieval_start meeting_id=%s mode=%s top_k=%d fallback_rewrite=%s",
@@ -270,8 +413,9 @@ class Retriever:
         )
 
         embed_started_at = now()
-        query_embedding = self._embedder.embed_query(rewrite_result.rewritten_query)
+        query_embedding = self._embed_query(rewrite_result.rewritten_query, use_cache=use_cache)
         embed_elapsed_ms = elapsed_ms(embed_started_at)
+        embed_cache_hit = bool(getattr(self._embedder, "last_cache_hit", False))
 
         search_top_k = final_top_k
         if retrieval_mode == "broad_summary":
@@ -281,13 +425,16 @@ class Retriever:
             )
 
         retrieval_started_at = now()
-        search_results = self._searcher.search_similar_chunks(
+        use_db_speaker_filter = retrieval_mode == "speaker_specific" and bool(speaker_filter)
+        search_results, db_filter_applied = self._search_similar_chunks(
             meeting_id=normalized_meeting_id,
             query_embedding=query_embedding,
             top_k=search_top_k,
+            speaker_filter=speaker_filter,
+            use_db_speaker_filter=use_db_speaker_filter,
         )
 
-        if retrieval_mode == "speaker_specific" and speaker_filter:
+        if retrieval_mode == "speaker_specific" and speaker_filter and not db_filter_applied:
             search_results = [
                 result
                 for result in search_results
@@ -316,12 +463,14 @@ class Retriever:
 
         timings_ms = {
             "query_rewrite": rewrite_elapsed_ms,
+            "query_embedding": embed_elapsed_ms,
             "embedding_query_prep": embed_elapsed_ms,
+            "postgres_retrieval": retrieval_elapsed_ms,
             "retrieval": retrieval_elapsed_ms,
             "retrieval_total": elapsed_ms(request_started_at),
         }
 
-        return RetrievalBundle(
+        bundle = RetrievalBundle(
             meeting_id=normalized_meeting_id,
             user_query=normalized_query,
             rewritten_query=rewrite_result.rewritten_query,
@@ -331,5 +480,18 @@ class Retriever:
             question_relation=rewrite_result.question_relation,
             used_cached_context=False,
             speaker_filter=speaker_filter,
-            service_metadata={"timings_ms": timings_ms},
+            service_metadata={
+                "timings_ms": timings_ms,
+                "cache": {
+                    "query_rewrite": rewrite_result.used_cache,
+                    "query_embedding": embed_cache_hit,
+                    "retrieval_bundle": False,
+                },
+                "fast_mode": fast_mode,
+            },
         )
+
+        if should_use_cache:
+            self._retrieval_cache.set(retrieval_cache_key, replace(bundle, service_metadata={}))
+
+        return bundle

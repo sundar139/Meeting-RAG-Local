@@ -16,8 +16,13 @@ class ScriptedRewriter:
         self,
         latest_user_question: str,
         conversation_context: list[str] | None = None,
+        *,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> QueryRewriteResult:
         _ = conversation_context
+        _ = use_cache
+        _ = fast_mode
         normalized = " ".join(latest_user_question.split())
         lower = normalized.lower()
 
@@ -44,8 +49,13 @@ class ScriptedRewriter:
 
 
 class FakeEmbedder:
-    def embed_query(self, text: str) -> list[float]:
+    def __init__(self) -> None:
+        self.last_cache_hit = False
+
+    def embed_query(self, text: str, *, use_cache: bool = True) -> list[float]:
         _ = text
+        _ = use_cache
+        self.last_cache_hit = False
         return [0.1, 0.2, 0.3]
 
 
@@ -58,11 +68,12 @@ class ScenarioSearcher:
         meeting_id: str,
         query_embedding: list[float],
         top_k: int = 10,
+        speaker_label: str | None = None,
     ) -> list[SimilarChunkResult]:
         _ = query_embedding
         _ = top_k
         self.call_count += 1
-        return [
+        rows = [
             SimilarChunkResult(
                 chunk_id=1,
                 meeting_id=meeting_id,
@@ -91,6 +102,9 @@ class ScenarioSearcher:
                 similarity=0.9,
             ),
         ]
+        if speaker_label is None:
+            return rows
+        return [row for row in rows if row.speaker_label == speaker_label]
 
 
 def _build_answer(bundle_mode: str, question: str, rewritten: str) -> GroundedAnswerResult:

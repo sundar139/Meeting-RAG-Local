@@ -23,7 +23,12 @@ class FakeRewriter:
         self,
         latest_user_question: str,
         conversation_context: list[str] | None = None,
+        *,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> QueryRewriteResult:
+        _ = use_cache
+        _ = fast_mode
         self.last_question = latest_user_question
         self.last_context = conversation_context
         return QueryRewriteResult(
@@ -36,9 +41,12 @@ class FakeRewriter:
 class FakeEmbedder:
     def __init__(self) -> None:
         self.last_text: str | None = None
+        self.last_cache_hit = False
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(self, text: str, *, use_cache: bool = True) -> list[float]:
+        _ = use_cache
         self.last_text = text
+        self.last_cache_hit = False
         return [0.1] * 768
 
 
@@ -47,16 +55,21 @@ class FakeSearcher:
         self.last_meeting_id: str | None = None
         self.last_embedding: list[float] | None = None
         self.last_top_k: int | None = None
+        self.last_speaker_label: str | None = None
+        self.call_count = 0
 
     def search_similar_chunks(
         self,
         meeting_id: str,
         query_embedding: list[float],
         top_k: int = 10,
+        speaker_label: str | None = None,
     ) -> list[SimilarChunkResult]:
+        self.call_count += 1
         self.last_meeting_id = meeting_id
         self.last_embedding = query_embedding
         self.last_top_k = top_k
+        self.last_speaker_label = speaker_label
         return [
             SimilarChunkResult(
                 chunk_id=1,
@@ -111,9 +124,11 @@ def test_retriever_returns_empty_bundle_when_no_hits() -> None:
             meeting_id: str,
             query_embedding: list[float],
             top_k: int = 10,
+            speaker_label: str | None = None,
         ) -> list[SimilarChunkResult]:
             _ = query_embedding
             _ = top_k
+            _ = speaker_label
             self.last_meeting_id = meeting_id
             return []
 
@@ -150,8 +165,13 @@ def test_retriever_uses_cached_context_for_meta_questions() -> None:
             self,
             latest_user_question: str,
             conversation_context: list[str] | None = None,
+            *,
+            use_cache: bool = True,
+            fast_mode: bool = False,
         ) -> QueryRewriteResult:
             _ = conversation_context
+            _ = use_cache
+            _ = fast_mode
             return QueryRewriteResult(
                 original_query=latest_user_question,
                 rewritten_query=latest_user_question,
@@ -203,11 +223,12 @@ def test_retriever_applies_speaker_filter_when_requested() -> None:
             meeting_id: str,
             query_embedding: list[float],
             top_k: int = 10,
+            speaker_label: str | None = None,
         ) -> list[SimilarChunkResult]:
             _ = query_embedding
             self.last_meeting_id = meeting_id
             self.last_top_k = top_k
-            return [
+            rows = [
                 SimilarChunkResult(
                     chunk_id=1,
                     meeting_id=meeting_id,
@@ -227,6 +248,9 @@ def test_retriever_applies_speaker_filter_when_requested() -> None:
                     similarity=0.85,
                 ),
             ]
+            if speaker_label is None:
+                return rows
+            return [row for row in rows if row.speaker_label == speaker_label]
 
     retriever = Retriever(
         searcher=MultiSearcher(),
@@ -248,8 +272,13 @@ def test_retriever_uses_broad_summary_policy_top_k_when_not_overridden() -> None
             self,
             latest_user_question: str,
             conversation_context: list[str] | None = None,
+            *,
+            use_cache: bool = True,
+            fast_mode: bool = False,
         ) -> QueryRewriteResult:
             _ = conversation_context
+            _ = use_cache
+            _ = fast_mode
             return QueryRewriteResult(
                 original_query=latest_user_question,
                 rewritten_query="Summarize the whole meeting",
@@ -271,14 +300,15 @@ def test_retriever_uses_broad_summary_policy_top_k_when_not_overridden() -> None
 
 
 def test_retriever_uses_configured_policy_defaults() -> None:
-    settings = Settings(
-        _env_file=None,
-        default_factoid_top_k=3,
-        speaker_specific_top_k=2,
-        action_items_or_decisions_top_k=9,
-        broad_summary_top_k=11,
-        meta_or_confidence_top_k=4,
-        broad_summary_max_candidates=15,
+    settings = Settings.model_validate(
+        {
+            "default_factoid_top_k": 3,
+            "speaker_specific_top_k": 2,
+            "action_items_or_decisions_top_k": 9,
+            "broad_summary_top_k": 11,
+            "meta_or_confidence_top_k": 4,
+            "broad_summary_max_candidates": 15,
+        }
     )
     searcher = FakeSearcher()
     retriever = Retriever(
@@ -301,9 +331,14 @@ def test_retriever_applies_custom_broad_summary_candidate_cap() -> None:
             self,
             latest_user_question: str,
             conversation_context: list[str] | None = None,
+            *,
+            use_cache: bool = True,
+            fast_mode: bool = False,
         ) -> QueryRewriteResult:
             _ = latest_user_question
             _ = conversation_context
+            _ = use_cache
+            _ = fast_mode
             return QueryRewriteResult(
                 original_query="Summarize the whole meeting",
                 rewritten_query="Summarize the whole meeting",
@@ -344,6 +379,48 @@ def test_retriever_exposes_timing_metadata() -> None:
 
     assert isinstance(timings, dict)
     assert "query_rewrite" in timings
+    assert "query_embedding" in timings
     assert "embedding_query_prep" in timings
+    assert "postgres_retrieval" in timings
     assert "retrieval" in timings
     assert "retrieval_total" in timings
+
+
+def test_retriever_uses_retrieval_bundle_cache_for_identical_requests() -> None:
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(),
+        embedder=FakeEmbedder(),
+    )
+
+    first = retriever.retrieve(meeting_id="m1", user_query="What did we decide?")
+    second = retriever.retrieve(meeting_id="m1", user_query="What did we decide?")
+
+    assert first.service_metadata.get("cache") is not None
+    assert second.service_metadata.get("cache") is not None
+    second_cache = second.service_metadata["cache"]
+    assert isinstance(second_cache, dict)
+    assert second_cache.get("retrieval_bundle") is True
+    assert searcher.call_count == 1
+
+
+def test_retriever_fast_mode_caps_policy_top_k_when_not_overridden() -> None:
+    settings = Settings.model_validate(
+        {
+            "default_factoid_top_k": 7,
+            "fast_mode_policy_top_k_cap": 3,
+        }
+    )
+    searcher = FakeSearcher()
+    retriever = Retriever(
+        searcher=searcher,
+        query_rewriter=FakeRewriter(),
+        embedder=FakeEmbedder(),
+        settings=settings,
+    )
+
+    bundle = retriever.retrieve(meeting_id="m1", user_query="status", fast_mode=True)
+
+    assert bundle.top_k_used == 3
+    assert searcher.last_top_k == 3

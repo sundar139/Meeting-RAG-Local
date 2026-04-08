@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from meeting_pipeline.config import Settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClientError
 from meeting_pipeline.rag.answer_generator import AnswerGenerator
 from meeting_pipeline.rag.models import (
@@ -185,3 +186,90 @@ def test_answer_generator_wraps_chat_errors() -> None:
             rewritten_query="decisions",
             retrieved_evidence=_sample_evidence(),
         )
+
+
+def test_answer_generator_compacts_evidence_and_uses_cache() -> None:
+    client = FakeChatClient(
+        '{"Summary":"Summary [chunk_id:7 speaker:SPEAKER_01 10.5-16.2]",'
+        '"Key Points":"Point",'
+        '"Decisions":"Decision",'
+        '"Action Items":"Action",'
+        '"Uncertainties / Missing Evidence":"None"}'
+    )
+    settings = Settings(
+        _env_file=None,
+        enable_rag_caching=True,
+        answer_cache_size=8,
+        answer_max_evidence_chunks=1,
+        answer_max_evidence_chars=500,
+        answer_max_chunk_chars=90,
+    )
+    generator = AnswerGenerator(client=client, model_name="llama-test", settings=settings)
+    long_evidence = [
+        RetrievedChunk(
+            chunk_id=7,
+            meeting_id="m1",
+            speaker_label="SPEAKER_01",
+            start_time=10.5,
+            end_time=16.2,
+            content="Long evidence " * 50,
+            similarity=0.95,
+        ),
+        RetrievedChunk(
+            chunk_id=8,
+            meeting_id="m1",
+            speaker_label="SPEAKER_00",
+            start_time=20.0,
+            end_time=25.0,
+            content="Secondary evidence " * 40,
+            similarity=0.82,
+        ),
+    ]
+
+    first = generator.generate(
+        user_question="What did we decide?",
+        meeting_id="m1",
+        rewritten_query="meeting decisions",
+        retrieved_evidence=long_evidence,
+    )
+    second = generator.generate(
+        user_question="What did we decide?",
+        meeting_id="m1",
+        rewritten_query="meeting decisions",
+        retrieved_evidence=long_evidence,
+    )
+
+    assert client.call_count == 1
+    assert client.last_messages is not None
+    assert "chunk_id:8" not in client.last_messages[1]["content"]
+
+    first_compaction = first.service_metadata.get("compaction")
+    assert isinstance(first_compaction, dict)
+    assert first_compaction.get("selected_chunks") == 1
+    assert first_compaction.get("dropped_chunks") == 1
+
+    second_cache = second.service_metadata.get("cache")
+    assert isinstance(second_cache, dict)
+    assert second_cache.get("answer_generation") is True
+
+
+def test_answer_generator_fast_mode_forces_short_summary_default() -> None:
+    client = FakeChatClient(
+        '{"Summary":"Sentence one. Sentence two. Sentence three.",'
+        '"Key Points":"A",'
+        '"Decisions":"B",'
+        '"Action Items":"C",'
+        '"Uncertainties / Missing Evidence":"None"}'
+    )
+    generator = AnswerGenerator(client=client, model_name="llama-test")
+
+    result = generator.generate(
+        user_question="Give me the meeting summary",
+        meeting_id="m1",
+        rewritten_query="meeting summary",
+        retrieved_evidence=_sample_evidence(),
+        fast_mode=True,
+    )
+
+    assert "Sentence three" not in result.sections["Summary"]
+    assert result.service_metadata.get("fast_mode") is True

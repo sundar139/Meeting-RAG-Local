@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from meeting_pipeline.config import Settings
 from meeting_pipeline.embeddings.embedder import Embedder
 
 
@@ -42,3 +43,17 @@ def test_embedder_validates_embedding_dimension() -> None:
 
     with pytest.raises(ValueError, match="dimension mismatch"):
         embedder.embed_document("hello")
+
+
+def test_embedder_caches_identical_query_embeddings() -> None:
+    client = RecordingClient(embedding=[0.1] * 768)
+    settings = Settings(_env_file=None, enable_rag_caching=True, query_embedding_cache_size=8)
+    embedder = Embedder(client=client, model_name="nomic-test", settings=settings)
+
+    first = embedder.embed_query("where are the decisions")
+    second = embedder.embed_query("where are the decisions")
+
+    assert len(first) == 768
+    assert len(second) == 768
+    assert len(client.calls) == 1
+    assert embedder.last_cache_hit is True

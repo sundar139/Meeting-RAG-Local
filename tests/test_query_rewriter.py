@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from meeting_pipeline.config import Settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClientError
 from meeting_pipeline.rag.query_rewriter import QueryRewriter
 
@@ -85,3 +86,27 @@ def test_query_rewriter_rejects_empty_question() -> None:
 
     with pytest.raises(ValueError):
         rewriter.rewrite("   ")
+
+
+def test_query_rewriter_caches_identical_inputs() -> None:
+    client = FakeChatClient("rewritten once")
+    settings = Settings(_env_file=None, enable_rag_caching=True, query_rewrite_cache_size=16)
+    rewriter = QueryRewriter(client=client, model_name="llama-test", settings=settings)
+
+    first = rewriter.rewrite("What did we decide?", conversation_context=["assistant: context"])
+    second = rewriter.rewrite("What did we decide?", conversation_context=["assistant: context"])
+
+    assert first.used_cache is False
+    assert second.used_cache is True
+    assert client.call_count == 1
+
+
+def test_query_rewriter_fast_mode_can_skip_model_call() -> None:
+    client = FakeChatClient("unused")
+    settings = Settings(_env_file=None, fast_mode_skip_query_rewrite=True)
+    rewriter = QueryRewriter(client=client, model_name="llama-test", settings=settings)
+
+    result = rewriter.rewrite("What decisions were made?", fast_mode=True)
+
+    assert result.rewritten_query == "What decisions were made?"
+    assert client.call_count == 0

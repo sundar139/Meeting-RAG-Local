@@ -45,6 +45,23 @@ class Settings(BaseSettings):
     meta_or_confidence_top_k: int = Field(default=6, ge=1)
     broad_summary_max_candidates: int = Field(default=28, ge=1)
 
+    enable_rag_caching: bool = True
+    query_rewrite_cache_size: int = Field(default=256, ge=1)
+    query_embedding_cache_size: int = Field(default=512, ge=1)
+    retrieval_bundle_cache_size: int = Field(default=256, ge=1)
+    answer_cache_size: int = Field(default=256, ge=1)
+
+    answer_max_evidence_chunks: int = Field(default=12, ge=1)
+    answer_max_evidence_chars: int = Field(default=12000, ge=500)
+    answer_max_chunk_chars: int = Field(default=600, ge=80)
+
+    enable_fast_mode: bool = False
+    fast_mode_skip_query_rewrite: bool = True
+    fast_mode_policy_top_k_cap: int = Field(default=6, ge=1)
+    fast_mode_answer_max_evidence_chunks: int = Field(default=8, ge=1)
+    fast_mode_answer_max_evidence_chars: int = Field(default=7500, ge=500)
+    fast_mode_answer_max_chunk_chars: int = Field(default=420, ge=80)
+
     whisperx_model: str = "large-v3"
     whisperx_device: Literal["cuda", "cpu"] = "cuda"
     whisperx_compute_type: str = "float16"

@@ -106,6 +106,26 @@ Tuning guidance:
 - Keep `META_OR_CONFIDENCE_TOP_K` moderate unless confidence audits need broader prior context.
 - Use sidebar override only for ad-hoc inspection; keep stable defaults in `.env` for repeatable demos.
 
+### Performance And Caching Environment Variables
+
+- `ENABLE_RAG_CACHING` (default `true`): master toggle for in-memory rewrite/embed/retrieval/answer caches.
+- `QUERY_REWRITE_CACHE_SIZE` (default `256`): max cached rewrite keys.
+- `QUERY_EMBEDDING_CACHE_SIZE` (default `512`): max cached query embeddings.
+- `RETRIEVAL_BUNDLE_CACHE_SIZE` (default `256`): max cached retrieval bundles.
+- `ANSWER_CACHE_SIZE` (default `256`): max cached grounded answers.
+- `ANSWER_MAX_EVIDENCE_CHUNKS` (default `12`): max evidence chunks included in answer prompt context.
+- `ANSWER_MAX_EVIDENCE_CHARS` (default `12000`): cap for total prompt evidence characters.
+- `ANSWER_MAX_CHUNK_CHARS` (default `600`): per-chunk evidence truncation cap.
+
+Fast mode environment toggles:
+
+- `ENABLE_FAST_MODE` (default `false`): enables conservative lower-latency path.
+- `FAST_MODE_SKIP_QUERY_REWRITE` (default `true`): skips model rewrite for clearly standalone prompts.
+- `FAST_MODE_POLICY_TOP_K_CAP` (default `6`): policy top-k cap used when fast mode is enabled.
+- `FAST_MODE_ANSWER_MAX_EVIDENCE_CHUNKS` (default `8`): prompt evidence chunk cap in fast mode.
+- `FAST_MODE_ANSWER_MAX_EVIDENCE_CHARS` (default `7500`): total evidence char cap in fast mode.
+- `FAST_MODE_ANSWER_MAX_CHUNK_CHARS` (default `420`): per-chunk char cap in fast mode.
+
 ## Database Setup
 
 1. Create database.
@@ -225,7 +245,9 @@ uv run streamlit run src/meeting_pipeline/app/app.py
 App behavior:
 
 - Sidebar meeting selection from ingested PostgreSQL data.
+- Sidebar fast mode toggle for demo-oriented latency optimization.
 - Optional adaptive top-k override for retrieval policy debugging.
+- Stage progress captions during each question cycle (retrieve -> answer).
 - Transcript browser with speaker filter and text filter.
 - Grounded chat panel with rewritten query, structured answer, and evidence expansion.
 - Per-answer diagnostics badges beside each assistant response:
@@ -234,13 +256,23 @@ App behavior:
   - context source (`Fresh` or `Cached`)
   - confidence status (`Grounded` or `Low`)
 - Optional latency summary in debug mode (`rewrite`, `embed`, `retrieve`, `answer`, `total`).
+- Optional cache summary in debug mode (`rewrite/embed/retrieve/answer` hit vs miss).
 - Meeting insights (chunk count, speakers, transcript span, recent questions).
 
 Debug mode notes:
 
 - Enable `Show technical errors` in the sidebar to expose exception traces and latency summaries.
+- Debug mode bypasses in-memory request caches so stage timing reflects fresh work.
 - Use low-confidence badges plus evidence expanders to diagnose insufficient-evidence responses quickly.
 - Keep debug mode off during normal demos for a cleaner UI.
+
+Timing metadata interpretation:
+
+- `query_rewrite`: rewrite stage latency.
+- `query_embedding`: embedding stage latency.
+- `postgres_retrieval`: pgvector retrieval latency.
+- `answer_generation`: answer synthesis latency.
+- `total_request`: end-to-end request latency.
 
 ## Demo Script (Recommended)
 
@@ -262,6 +294,46 @@ uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisio
 ```
 
 This prints retrieved evidence first (debug preview), then the final answer payload including latency timings.
+
+Fast-mode smoke example:
+
+```bash
+uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --fast-mode
+```
+
+No-cache smoke example:
+
+```bash
+uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --no-cache
+```
+
+## Benchmarking Latency
+
+Benchmark helper:
+
+```bash
+uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --question "What did SPEAKER_00 discuss?" --runs 3
+```
+
+Fast-mode benchmark:
+
+```bash
+uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --runs 5 --fast-mode
+```
+
+Fresh-work benchmark (cache disabled):
+
+```bash
+uv run python scripts/benchmark_rag.py --meeting-id ES2002a --question "What decisions were made?" --runs 5 --no-cache
+```
+
+Benchmark output includes average total latency, per-stage averages, and cache hit rates.
+
+## Performance Tradeoffs
+
+- Default mode prioritizes safer retrieval breadth and fuller prompt context.
+- Fast mode reduces latency by capping policy top-k, tightening evidence compaction, and optionally skipping rewrite for clearly standalone questions.
+- In-memory caches improve repeated-question responsiveness but are process-local and reset when the app process restarts.
 
 ## Troubleshooting
 

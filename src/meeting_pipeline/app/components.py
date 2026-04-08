@@ -123,14 +123,42 @@ def _format_latency_summary(service_metadata: Mapping[str, object] | None) -> st
     if not timings:
         return None
 
+    label_candidates = [
+        (("query_rewrite",), "rewrite"),
+        (("query_embedding", "embedding_query_prep"), "embed"),
+        (("postgres_retrieval", "retrieval"), "retrieve"),
+        (("answer_generation",), "answer"),
+        (("total_request", "retrieval_total"), "total"),
+    ]
+    parts: list[str] = []
+    for candidates, short in label_candidates:
+        for key in candidates:
+            if key in timings:
+                parts.append(f"{short} {timings[key]:.1f} ms")
+                break
+    return " | ".join(parts) if parts else None
+
+
+def _format_cache_summary(service_metadata: Mapping[str, object] | None) -> str | None:
+    if service_metadata is None:
+        return None
+
+    raw_cache = service_metadata.get("cache")
+    if not isinstance(raw_cache, dict):
+        return None
+
     labels = [
         ("query_rewrite", "rewrite"),
-        ("embedding_query_prep", "embed"),
-        ("retrieval", "retrieve"),
+        ("query_embedding", "embed"),
+        ("retrieval_bundle", "retrieve"),
         ("answer_generation", "answer"),
-        ("total_request", "total"),
     ]
-    parts = [f"{short} {timings[key]:.1f} ms" for key, short in labels if key in timings]
+    parts: list[str] = []
+    for key, short in labels:
+        value = raw_cache.get(key)
+        if isinstance(value, bool):
+            parts.append(f"{short} {'hit' if value else 'miss'}")
+
     return " | ".join(parts) if parts else None
 
 
@@ -180,6 +208,18 @@ def render_response_diagnostics(
                     '<div style="font-size:0.82rem;color:#6B7280;margin-top:-0.1rem;'
                     'margin-bottom:0.45rem;">'
                     f"Latency: {latency_summary}"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+        cache_summary = _format_cache_summary(service_metadata)
+        if cache_summary:
+            st.markdown(
+                (
+                    '<div style="font-size:0.82rem;color:#6B7280;margin-top:-0.2rem;'
+                    'margin-bottom:0.45rem;">'
+                    f"Cache: {cache_summary}"
                     "</div>"
                 ),
                 unsafe_allow_html=True,

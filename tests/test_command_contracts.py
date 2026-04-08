@@ -11,6 +11,7 @@ EXPECTED_ENTRYPOINTS = [
     "scripts/ingest_many_meetings.py",
     "scripts/report_ami_meeting_readiness.py",
     "scripts/smoke_rag.py",
+    "scripts/benchmark_rag.py",
     "src/meeting_pipeline/app/app.py",
 ]
 

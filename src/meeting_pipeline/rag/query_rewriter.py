@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 
+from meeting_pipeline.cache_utils import LruCache
 from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClient, OllamaClientError
 from meeting_pipeline.rag.models import QueryRelation, QueryRewriteResult
@@ -63,7 +65,6 @@ def _rewrite_is_lossy(original: str, rewritten: str) -> bool:
     if not rewritten:
         return True
 
-    lower_original = original.lower()
     lower_rewritten = rewritten.lower()
 
     # Reject collapsed rewrites that drop too much detail for longer prompts.
@@ -95,10 +96,38 @@ def _rewrite_is_lossy(original: str, rewritten: str) -> bool:
 
     # Keep direct quotes intact when present.
     quoted_fragments = re.findall(r'"([^"]{3,})"', original)
-    if quoted_fragments and not any(fragment.lower() in lower_rewritten for fragment in quoted_fragments):
+    if quoted_fragments and not any(
+        fragment.lower() in lower_rewritten for fragment in quoted_fragments
+    ):
         return True
 
     return False
+
+
+def _rewrite_cache_key(
+    normalized_question: str,
+    context_lines: Sequence[str],
+    question_relation: QueryRelation,
+) -> tuple[str, tuple[str, ...], QueryRelation]:
+    return (normalized_question, tuple(context_lines), question_relation)
+
+
+def _is_fast_mode_rewrite_skip_candidate(
+    normalized_question: str,
+    question_relation: QueryRelation,
+    context_lines: Sequence[str],
+) -> bool:
+    if question_relation != "standalone_direct":
+        return False
+    if context_lines:
+        return False
+    if len(normalized_question) > 180:
+        return False
+    if _contains_format_instruction(normalized_question):
+        return False
+    if _SPEAKER_TOKEN_PATTERN.search(normalized_question):
+        return False
+    return True
 
 
 class QueryRewriter:
@@ -113,11 +142,19 @@ class QueryRewriter:
         configured_model = model_name or runtime_settings.ollama_chat_model
         normalized_model = str(configured_model).strip()
         self._model_name = normalized_model or DEFAULT_CHAT_MODEL
+        self._cache_enabled = runtime_settings.enable_rag_caching
+        self._fast_mode_skip_rewrite = runtime_settings.fast_mode_skip_query_rewrite
+        self._rewrite_cache = LruCache[
+            tuple[str, tuple[str, ...], QueryRelation], QueryRewriteResult
+        ](runtime_settings.query_rewrite_cache_size)
 
     def rewrite(
         self,
         latest_user_question: str,
         conversation_context: Sequence[str] | None = None,
+        *,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> QueryRewriteResult:
         normalized_question = " ".join(latest_user_question.split())
         if not normalized_question:
@@ -129,21 +166,54 @@ class QueryRewriter:
         question_relation = _infer_question_relation(normalized_question, context_lines)
         context_block = "\n".join(f"- {item}" for item in context_lines)
 
-        if question_relation == "meta_chat_scope":
-            return QueryRewriteResult(
+        cache_key = _rewrite_cache_key(normalized_question, context_lines, question_relation)
+        should_use_cache = use_cache and self._cache_enabled
+        if should_use_cache:
+            cached = self._rewrite_cache.get(cache_key)
+            if cached is not None:
+                return replace(cached, used_cache=True)
+
+        if (
+            fast_mode
+            and self._fast_mode_skip_rewrite
+            and _is_fast_mode_rewrite_skip_candidate(
+                normalized_question,
+                question_relation,
+                context_lines,
+            )
+        ):
+            skip_result = QueryRewriteResult(
                 original_query=normalized_question,
                 rewritten_query=normalized_question,
                 used_fallback=True,
                 question_relation=question_relation,
                 was_lossy=False,
+                used_cache=False,
             )
+            if should_use_cache:
+                self._rewrite_cache.set(cache_key, skip_result)
+            return skip_result
+
+        if question_relation == "meta_chat_scope":
+            meta_result = QueryRewriteResult(
+                original_query=normalized_question,
+                rewritten_query=normalized_question,
+                used_fallback=True,
+                question_relation=question_relation,
+                was_lossy=False,
+                used_cache=False,
+            )
+            if should_use_cache:
+                self._rewrite_cache.set(cache_key, meta_result)
+            return meta_result
 
         system_prompt = (
             "Rewrite the latest user question into a standalone retrieval query for a meeting "
             "transcript search system. Preserve every concrete constraint from the user: speaker "
             "labels, names, numbers, dates, requested output format, scope qualifiers, and action "
-            "vs summary intent. Keep the query semantically equivalent and do not broaden or narrow "
-            "scope. Do not answer the question. Do not invent facts. Return only rewritten query text."
+            "vs summary intent. Keep the query semantically equivalent and do not broaden or "
+            "narrow scope. Do not answer the question. Do not invent facts. Return only "
+            "rewritten query text."
         )
 
         user_prompt = (
@@ -167,27 +237,39 @@ class QueryRewriter:
 
             if _rewrite_is_lossy(normalized_question, normalized_rewrite):
                 LOGGER.info("Rewrite deemed lossy; preserving original query.")
-                return QueryRewriteResult(
+                lossy_result = QueryRewriteResult(
                     original_query=normalized_question,
                     rewritten_query=normalized_question,
                     used_fallback=True,
                     question_relation=question_relation,
                     was_lossy=True,
+                    used_cache=False,
                 )
+                if should_use_cache:
+                    self._rewrite_cache.set(cache_key, lossy_result)
+                return lossy_result
 
-            return QueryRewriteResult(
+            result = QueryRewriteResult(
                 original_query=normalized_question,
                 rewritten_query=normalized_rewrite,
                 used_fallback=False,
                 question_relation=question_relation,
                 was_lossy=False,
+                used_cache=False,
             )
+            if should_use_cache:
+                self._rewrite_cache.set(cache_key, result)
+            return result
         except (OllamaClientError, ValueError) as exc:
             LOGGER.warning("Query rewriting failed; using fallback query. reason=%s", exc)
-            return QueryRewriteResult(
+            fallback_result = QueryRewriteResult(
                 original_query=normalized_question,
                 rewritten_query=normalized_question,
                 used_fallback=True,
                 question_relation=question_relation,
                 was_lossy=False,
+                used_cache=False,
             )
+            if should_use_cache:
+                self._rewrite_cache.set(cache_key, fallback_result)
+            return fallback_result

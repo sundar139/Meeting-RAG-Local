@@ -83,12 +83,16 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
             conversation_context: list[str] | None = None,
             top_k: int | None = None,
             conversation_state: ConversationState | None = None,
+            use_cache: bool = True,
+            fast_mode: bool = False,
         ) -> RetrievalBundle:
             _ = meeting_id
             _ = user_query
             _ = conversation_context
             _ = top_k
             _ = conversation_state
+            _ = use_cache
+            _ = fast_mode
             return RetrievalBundle(
                 meeting_id="m1",
                 user_query="What decisions were made?",
@@ -96,6 +100,13 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
                 top_k_used=5,
                 results=[],
                 retrieval_mode="default_factoid",
+                service_metadata={
+                    "cache": {
+                        "query_rewrite": True,
+                        "query_embedding": False,
+                        "retrieval_bundle": False,
+                    }
+                },
             )
 
     class FakeAnswerGenerator:
@@ -109,6 +120,8 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
             conversation_context: list[str] | None = None,
             retrieval_mode: str = "default_factoid",
             recent_state: ConversationState | None = None,
+            use_cache: bool = True,
+            fast_mode: bool = False,
         ) -> GroundedAnswerResult:
             _ = user_question
             _ = meeting_id
@@ -117,6 +130,8 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
             _ = conversation_context
             _ = retrieval_mode
             _ = recent_state
+            _ = use_cache
+            _ = fast_mode
             return GroundedAnswerResult(
                 meeting_id="m1",
                 question="What decisions were made?",
@@ -124,6 +139,7 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
                 sections={"Summary": "Insufficient context to answer."},
                 raw_answer="Insufficient context to answer.",
                 insufficient_context=True,
+                service_metadata={"cache": {"answer_generation": True}},
             )
 
     bundle, answer = _run_rag_services(
@@ -141,6 +157,10 @@ def test_run_rag_services_handles_insufficient_context_flow() -> None:
     timings = answer.service_metadata.get("timings_ms")
     assert isinstance(timings, dict)
     assert "total_request" in timings
+    cache = answer.service_metadata.get("cache")
+    assert isinstance(cache, dict)
+    assert cache.get("query_rewrite") is True
+    assert cache.get("answer_generation") is True
 
 
 def test_user_facing_error_message_maps_known_service_errors() -> None:

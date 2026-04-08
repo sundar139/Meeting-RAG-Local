@@ -25,6 +25,7 @@ class QueryRewriteResult:
     used_fallback: bool
     question_relation: QueryRelation = "standalone_direct"
     was_lossy: bool = False
+    used_cache: bool = False
 
 
 @dataclass(frozen=True)

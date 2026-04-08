@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any, Protocol, cast
 
 from meeting_pipeline.app import components
 from meeting_pipeline.app.components import page_title
-from meeting_pipeline.config import get_settings
+from meeting_pipeline.cache_utils import LruCache
+from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.db.connection import DatabaseConnectionError, connection_scope
 from meeting_pipeline.db.pgvector_search import PgVectorSearcher
 from meeting_pipeline.db.repository import (
@@ -14,7 +15,9 @@ from meeting_pipeline.db.repository import (
     TranscriptChunk,
     TranscriptChunkRepository,
 )
+from meeting_pipeline.embeddings.embedder import Embedder
 from meeting_pipeline.embeddings.ollama_client import (
+    OllamaClient,
     OllamaMalformedResponseError,
     OllamaModelNotFoundError,
     OllamaUnavailableError,
@@ -28,7 +31,8 @@ from meeting_pipeline.rag.models import (
     RetrievalMode,
     RetrievedChunk,
 )
-from meeting_pipeline.rag.retriever import Retriever
+from meeting_pipeline.rag.query_rewriter import QueryRewriter
+from meeting_pipeline.rag.retriever import RetrievalCacheKey, Retriever
 from meeting_pipeline.timing import elapsed_ms, now
 
 
@@ -41,6 +45,8 @@ class RetrieverProtocol(Protocol):
         conversation_context: list[str] | None = None,
         top_k: int | None = None,
         conversation_state: ConversationState | None = None,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> RetrievalBundle: ...
 
 
@@ -55,6 +61,8 @@ class AnswerGeneratorProtocol(Protocol):
         conversation_context: Sequence[str] | None = None,
         retrieval_mode: RetrievalMode = "default_factoid",
         recent_state: ConversationState | None = None,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> GroundedAnswerResult: ...
 
 
@@ -80,6 +88,13 @@ def _ensure_session_state(state: SessionStateProtocol) -> None:
         "latest_answer": None,
         "recent_turn_states": [],
         "pending_question": None,
+        "_cached_meeting_ids": None,
+        "_cached_meeting_data": {},
+        "_shared_ollama_client": None,
+        "_shared_query_rewriter": None,
+        "_shared_embedder": None,
+        "_shared_answer_generator": None,
+        "_shared_retrieval_cache": None,
     }
     for key, value in defaults.items():
         if key not in state:
@@ -94,6 +109,11 @@ def _reset_chat_state(state: SessionStateProtocol) -> None:
     state["latest_answer"] = None
     state["recent_turn_states"] = []
     state["pending_question"] = None
+
+
+def _reset_meeting_cache(state: SessionStateProtocol) -> None:
+    state["_cached_meeting_ids"] = None
+    state["_cached_meeting_data"] = {}
 
 
 def _apply_meeting_selection(state: SessionStateProtocol, meeting_id: str) -> bool:
@@ -159,7 +179,7 @@ def _build_assistant_message(answer: GroundedAnswerResult) -> str:
 def _user_facing_error_message(error: Exception) -> str:
     if isinstance(error, DatabaseConnectionError):
         return (
-            "Database unavailable. Confirm PostgreSQL is running and "
+            "PostgreSQL database unavailable. Confirm PostgreSQL is running and "
             "POSTGRES_* values are correct."
         )
     if isinstance(error, OllamaUnavailableError):
@@ -183,6 +203,53 @@ def _extract_timing_map(metadata: dict[str, object]) -> dict[str, float]:
     return parsed
 
 
+def _extract_cache_map(metadata: dict[str, object]) -> dict[str, bool]:
+    raw = metadata.get("cache")
+    if not isinstance(raw, dict):
+        return {}
+
+    parsed: dict[str, bool] = {}
+    for key, value in raw.items():
+        if isinstance(key, str) and isinstance(value, bool):
+            parsed[key] = value
+    return parsed
+
+
+def _get_shared_services(
+    state: SessionStateProtocol,
+    *,
+    settings: Settings,
+) -> tuple[QueryRewriter, Embedder, AnswerGenerator, LruCache[RetrievalCacheKey, RetrievalBundle]]:
+    shared_client = state.get("_shared_ollama_client")
+    if not isinstance(shared_client, OllamaClient):
+        shared_client = OllamaClient.from_settings(settings)
+        state["_shared_ollama_client"] = shared_client
+
+    rewriter = state.get("_shared_query_rewriter")
+    if not isinstance(rewriter, QueryRewriter):
+        rewriter = QueryRewriter(client=shared_client, settings=settings)
+        state["_shared_query_rewriter"] = rewriter
+
+    embedder = state.get("_shared_embedder")
+    if not isinstance(embedder, Embedder):
+        embedder = Embedder(client=shared_client, settings=settings)
+        state["_shared_embedder"] = embedder
+
+    answer_generator = state.get("_shared_answer_generator")
+    if not isinstance(answer_generator, AnswerGenerator):
+        answer_generator = AnswerGenerator(client=shared_client, settings=settings)
+        state["_shared_answer_generator"] = answer_generator
+
+    retrieval_cache = state.get("_shared_retrieval_cache")
+    if not isinstance(retrieval_cache, LruCache):
+        retrieval_cache = LruCache[RetrievalCacheKey, RetrievalBundle](
+            settings.retrieval_bundle_cache_size
+        )
+        state["_shared_retrieval_cache"] = retrieval_cache
+
+    return rewriter, embedder, answer_generator, retrieval_cache
+
+
 def _run_rag_services(
     *,
     meeting_id: str,
@@ -192,15 +259,24 @@ def _run_rag_services(
     retriever: RetrieverProtocol,
     answer_generator: AnswerGeneratorProtocol,
     conversation_state: ConversationState | None = None,
+    use_cache: bool = True,
+    fast_mode: bool = False,
+    progress_reporter: Callable[[str], None] | None = None,
 ) -> tuple[RetrievalBundle, GroundedAnswerResult]:
     request_started_at = now()
+    if progress_reporter is not None:
+        progress_reporter("Rewriting, embedding, and retrieving evidence")
     bundle = retriever.retrieve(
         meeting_id=meeting_id,
         user_query=user_question,
         conversation_context=conversation_context,
         top_k=top_k,
         conversation_state=conversation_state,
+        use_cache=use_cache,
+        fast_mode=fast_mode,
     )
+    if progress_reporter is not None:
+        progress_reporter("Generating grounded answer")
     answer = answer_generator.generate(
         user_question=user_question,
         meeting_id=meeting_id,
@@ -209,14 +285,26 @@ def _run_rag_services(
         conversation_context=conversation_context,
         retrieval_mode=bundle.retrieval_mode,
         recent_state=conversation_state,
+        use_cache=use_cache,
+        fast_mode=fast_mode,
     )
     merged_timings = _extract_timing_map(bundle.service_metadata)
     merged_timings.update(_extract_timing_map(answer.service_metadata))
     merged_timings["total_request"] = elapsed_ms(request_started_at)
 
+    merged_cache = _extract_cache_map(bundle.service_metadata)
+    merged_cache.update(_extract_cache_map(answer.service_metadata))
+
     service_metadata = dict(answer.service_metadata)
     service_metadata["timings_ms"] = merged_timings
+    service_metadata["cache"] = merged_cache
+    service_metadata["fast_mode"] = bool(
+        service_metadata.get("fast_mode") or bundle.service_metadata.get("fast_mode")
+    )
     answer = replace(answer, service_metadata=service_metadata)
+
+    if progress_reporter is not None:
+        progress_reporter("Completed")
     return bundle, answer
 
 
@@ -239,6 +327,42 @@ def _load_meeting_data(
     return overview, speakers, chunks
 
 
+def _load_meeting_ids_cached(
+    state: SessionStateProtocol,
+    *,
+    force_refresh: bool = False,
+) -> list[str]:
+    if not force_refresh:
+        cached = state.get("_cached_meeting_ids")
+        if isinstance(cached, list):
+            return [str(item) for item in cached]
+
+    loaded = _load_meeting_ids()
+    state["_cached_meeting_ids"] = loaded
+    return loaded
+
+
+def _load_meeting_data_cached(
+    state: SessionStateProtocol,
+    meeting_id: str,
+    *,
+    force_refresh: bool = False,
+) -> tuple[MeetingOverview, list[str], list[TranscriptChunk]]:
+    cache = state.get("_cached_meeting_data")
+    if not isinstance(cache, dict):
+        cache = {}
+
+    if not force_refresh and meeting_id in cache:
+        cached_value = cache[meeting_id]
+        if isinstance(cached_value, tuple) and len(cached_value) == 3:
+            return cast(tuple[MeetingOverview, list[str], list[TranscriptChunk]], cached_value)
+
+    loaded = _load_meeting_data(meeting_id)
+    cache[meeting_id] = loaded
+    state["_cached_meeting_data"] = cache
+    return loaded
+
+
 def _execute_chat_turn(
     *,
     meeting_id: str,
@@ -246,11 +370,24 @@ def _execute_chat_turn(
     top_k: int | None,
     conversation_context: list[str],
     conversation_state: ConversationState | None,
+    query_rewriter: QueryRewriter,
+    embedder: Embedder,
+    answer_generator: AnswerGenerator,
+    retrieval_cache: LruCache[RetrievalCacheKey, RetrievalBundle],
+    settings: Settings,
+    use_cache: bool,
+    fast_mode: bool,
+    progress_reporter: Callable[[str], None] | None = None,
 ) -> tuple[RetrievalBundle, GroundedAnswerResult]:
     with connection_scope(application_name="meeting_pipeline:streamlit_retrieve") as connection:
         searcher = PgVectorSearcher(connection)
-        retriever = Retriever(searcher=searcher)
-        answer_generator = AnswerGenerator()
+        retriever = Retriever(
+            searcher=searcher,
+            query_rewriter=query_rewriter,
+            embedder=embedder,
+            settings=settings,
+            retrieval_cache=retrieval_cache,
+        )
         return _run_rag_services(
             meeting_id=meeting_id,
             user_question=user_question,
@@ -259,6 +396,9 @@ def _execute_chat_turn(
             retriever=retriever,
             answer_generator=answer_generator,
             conversation_state=conversation_state,
+            use_cache=use_cache,
+            fast_mode=fast_mode,
+            progress_reporter=progress_reporter,
         )
 
 
@@ -275,14 +415,22 @@ def main() -> None:
 
     st.sidebar.header("Controls")
     debug_mode = st.sidebar.checkbox("Show technical errors", value=False)
+    fast_mode = st.sidebar.checkbox(
+        "Fast mode (lower latency)",
+        value=settings.enable_fast_mode,
+        help="Uses conservative latency optimizations for demos while keeping grounded answers.",
+    )
     override_top_k = st.sidebar.checkbox("Override adaptive top-k", value=False)
     top_k_override: int | None = None
     if override_top_k:
         top_k_override = st.sidebar.slider("Evidence top-k", min_value=1, max_value=20, value=8)
+    refresh_meeting_cache = st.sidebar.button("Refresh meeting metadata", use_container_width=True)
+    if refresh_meeting_cache:
+        _reset_meeting_cache(state)
 
     try:
         with st.spinner("Loading meetings..."):
-            available_meetings = _load_meeting_ids()
+            available_meetings = _load_meeting_ids_cached(state)
     except Exception as exc:
         components.render_warning(_user_facing_error_message(exc))
         if debug_mode:
@@ -322,7 +470,7 @@ def main() -> None:
 
     try:
         with st.spinner("Loading transcript and meeting details..."):
-            overview, speakers, chunks = _load_meeting_data(selected_meeting)
+            overview, speakers, chunks = _load_meeting_data_cached(state, selected_meeting)
     except Exception as exc:
         components.render_warning(_user_facing_error_message(exc))
         if debug_mode:
@@ -387,20 +535,39 @@ def main() -> None:
                 st.write(question)
 
             try:
-                with st.spinner("Retrieving evidence and generating grounded answer..."):
-                    context = _build_conversation_context(state["chat_messages"])
-                    conversation_state = ConversationState(
-                        latest_bundle=state.get("latest_evidence_bundle"),
-                        latest_answer=state.get("latest_answer"),
-                        recent_turns=state.get("recent_turn_states") or [],
-                    )
-                    bundle, answer = _execute_chat_turn(
-                        meeting_id=selected_meeting,
-                        user_question=question,
-                        top_k=top_k_override,
-                        conversation_context=context,
-                        conversation_state=conversation_state,
-                    )
+                stage_placeholder = st.empty()
+
+                def _report_stage(stage: str) -> None:
+                    stage_placeholder.caption(f"Stage: {stage}")
+
+                _report_stage("Initializing services")
+                query_rewriter, embedder, answer_generator, retrieval_cache = _get_shared_services(
+                    state,
+                    settings=settings,
+                )
+
+                context = _build_conversation_context(state["chat_messages"])
+                conversation_state = ConversationState(
+                    latest_bundle=state.get("latest_evidence_bundle"),
+                    latest_answer=state.get("latest_answer"),
+                    recent_turns=state.get("recent_turn_states") or [],
+                )
+                bundle, answer = _execute_chat_turn(
+                    meeting_id=selected_meeting,
+                    user_question=question,
+                    top_k=top_k_override,
+                    conversation_context=context,
+                    conversation_state=conversation_state,
+                    query_rewriter=query_rewriter,
+                    embedder=embedder,
+                    answer_generator=answer_generator,
+                    retrieval_cache=retrieval_cache,
+                    settings=settings,
+                    use_cache=not (debug_mode or override_top_k),
+                    fast_mode=fast_mode,
+                    progress_reporter=_report_stage,
+                )
+                stage_placeholder.empty()
             except Exception as exc:
                 components.render_warning(_user_facing_error_message(exc))
                 if debug_mode:

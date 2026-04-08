@@ -4,8 +4,10 @@ import json
 import logging
 import re
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from hashlib import sha1
 
+from meeting_pipeline.cache_utils import LruCache
 from meeting_pipeline.config import Settings, get_settings
 from meeting_pipeline.embeddings.ollama_client import OllamaClient, OllamaClientError
 from meeting_pipeline.rag.models import (
@@ -27,6 +29,88 @@ SECTION_ORDER = [
     "Uncertainties / Missing Evidence",
 ]
 
+AnswerCacheKey = tuple[str, str, RetrievalMode, tuple[object, ...], bool]
+
+
+@dataclass(frozen=True)
+class EvidenceCompactionPolicy:
+    max_chunks: int
+    max_total_chars: int
+    max_chunk_chars: int
+
+
+def _format_directives_signature(directives: FormatDirectives) -> tuple[object, ...]:
+    return (
+        directives.bullet_count,
+        directives.use_table,
+        directives.short_summary,
+        directives.action_items_only,
+    )
+
+
+def _evidence_signature(evidence: Sequence[RetrievedChunk]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            chunk.chunk_id,
+            chunk.speaker_label,
+            round(chunk.start_time, 3),
+            round(chunk.end_time, 3),
+            round(chunk.similarity, 6),
+            sha1(chunk.content.encode("utf-8")).hexdigest()[:12],
+        )
+        for chunk in evidence
+    )
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= max_chars:
+        return normalized
+    if max_chars <= 3:
+        return normalized[:max_chars]
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _compact_evidence_for_prompt(
+    evidence: Sequence[RetrievedChunk],
+    policy: EvidenceCompactionPolicy,
+) -> tuple[list[RetrievedChunk], dict[str, int]]:
+    ranked = sorted(
+        evidence,
+        key=lambda chunk: (-chunk.similarity, chunk.start_time, chunk.chunk_id),
+    )
+
+    selected: list[RetrievedChunk] = []
+    total_chars = 0
+    truncated_chunks = 0
+
+    for chunk in ranked:
+        if len(selected) >= policy.max_chunks:
+            break
+        if total_chars >= policy.max_total_chars:
+            break
+
+        remaining = policy.max_total_chars - total_chars
+        chunk_limit = min(policy.max_chunk_chars, remaining)
+        if chunk_limit < 80:
+            break
+
+        compact_content = _truncate_text(chunk.content, chunk_limit)
+        if compact_content != " ".join(chunk.content.split()):
+            truncated_chunks += 1
+
+        selected.append(replace(chunk, content=compact_content))
+        total_chars += len(compact_content)
+
+    metadata = {
+        "original_chunks": len(evidence),
+        "selected_chunks": len(selected),
+        "dropped_chunks": max(0, len(evidence) - len(selected)),
+        "truncated_chunks": truncated_chunks,
+        "total_evidence_chars": total_chars,
+    }
+    return selected, metadata
+
 
 class AnswerGenerator:
     def __init__(
@@ -40,6 +124,20 @@ class AnswerGenerator:
         configured_model = model_name or runtime_settings.ollama_chat_model
         normalized_model = str(configured_model).strip()
         self._model_name = normalized_model or DEFAULT_CHAT_MODEL
+        self._cache_enabled = runtime_settings.enable_rag_caching
+        self._answer_cache = LruCache[AnswerCacheKey, GroundedAnswerResult](
+            runtime_settings.answer_cache_size
+        )
+        self._default_compaction_policy = EvidenceCompactionPolicy(
+            max_chunks=runtime_settings.answer_max_evidence_chunks,
+            max_total_chars=runtime_settings.answer_max_evidence_chars,
+            max_chunk_chars=runtime_settings.answer_max_chunk_chars,
+        )
+        self._fast_compaction_policy = EvidenceCompactionPolicy(
+            max_chunks=runtime_settings.fast_mode_answer_max_evidence_chunks,
+            max_total_chars=runtime_settings.fast_mode_answer_max_evidence_chars,
+            max_chunk_chars=runtime_settings.fast_mode_answer_max_chunk_chars,
+        )
 
     def generate(
         self,
@@ -51,6 +149,8 @@ class AnswerGenerator:
         conversation_context: Sequence[str] | None = None,
         retrieval_mode: RetrievalMode = "default_factoid",
         recent_state: ConversationState | None = None,
+        use_cache: bool = True,
+        fast_mode: bool = False,
     ) -> GroundedAnswerResult:
         generation_started_at = now()
         normalized_question = " ".join(user_question.split())
@@ -65,8 +165,39 @@ class AnswerGenerator:
             raise ValueError("rewritten_query must be a non-empty string")
 
         directives = _extract_format_directives(normalized_question)
+        if fast_mode and not directives.short_summary:
+            directives = replace(directives, short_summary=True)
 
-        if not retrieved_evidence:
+        compaction_policy = (
+            self._fast_compaction_policy if fast_mode else self._default_compaction_policy
+        )
+        compacted_evidence, compaction_metadata = _compact_evidence_for_prompt(
+            retrieved_evidence,
+            compaction_policy,
+        )
+        should_use_cache = use_cache and self._cache_enabled
+        cache_key: AnswerCacheKey = (
+            normalized_meeting_id,
+            normalized_rewrite,
+            retrieval_mode,
+            _format_directives_signature(directives) + (_evidence_signature(compacted_evidence),),
+            fast_mode,
+        )
+
+        if should_use_cache:
+            cached = self._answer_cache.get(cache_key)
+            if cached is not None:
+                return _with_answer_timing(
+                    replace(cached, question=normalized_question),
+                    generation_started_at,
+                    cache_metadata={
+                        "answer_generation": True,
+                    },
+                    compaction_metadata=compaction_metadata,
+                    fast_mode=fast_mode,
+                )
+
+        if not compacted_evidence:
             if retrieval_mode == "meta_or_confidence" and recent_state is not None:
                 return _with_answer_timing(
                     _build_meta_answer_from_state(
@@ -76,6 +207,11 @@ class AnswerGenerator:
                         recent_state=recent_state,
                     ),
                     generation_started_at,
+                    cache_metadata={
+                        "answer_generation": False,
+                    },
+                    compaction_metadata=compaction_metadata,
+                    fast_mode=fast_mode,
                 )
 
             sections = _build_insufficient_sections(retrieval_mode)
@@ -91,12 +227,17 @@ class AnswerGenerator:
                     insufficient_context=True,
                 ),
                 generation_started_at,
+                cache_metadata={
+                    "answer_generation": False,
+                },
+                compaction_metadata=compaction_metadata,
+                fast_mode=fast_mode,
             )
 
         context_lines = [
             f"[chunk_id:{chunk.chunk_id} speaker:{chunk.speaker_label} "
             f"{chunk.start_time:.2f}-{chunk.end_time:.2f}] {chunk.content}"
-            for chunk in retrieved_evidence
+            for chunk in compacted_evidence
         ]
         context_block = "\n".join(context_lines)
 
@@ -134,7 +275,7 @@ class AnswerGenerator:
             f"Retrieved evidence:\n{context_block}"
         )
 
-        LOGGER.info("Generating grounded answer evidence_count=%d", len(retrieved_evidence))
+        LOGGER.info("Generating grounded answer evidence_count=%d", len(compacted_evidence))
         try:
             raw_answer = self._client.chat(
                 model=self._model_name,
@@ -150,16 +291,25 @@ class AnswerGenerator:
         sections = _apply_format_directives(sections, directives)
         insufficient = _is_insufficient_answer(sections)
 
+        result = GroundedAnswerResult(
+            meeting_id=normalized_meeting_id,
+            question=normalized_question,
+            rewritten_query=normalized_rewrite,
+            sections=sections,
+            raw_answer=raw_answer,
+            insufficient_context=insufficient,
+        )
+        if should_use_cache:
+            self._answer_cache.set(cache_key, replace(result, service_metadata={}))
+
         return _with_answer_timing(
-            GroundedAnswerResult(
-                meeting_id=normalized_meeting_id,
-                question=normalized_question,
-                rewritten_query=normalized_rewrite,
-                sections=sections,
-                raw_answer=raw_answer,
-                insufficient_context=insufficient,
-            ),
+            result,
             generation_started_at,
+            cache_metadata={
+                "answer_generation": False,
+            },
+            compaction_metadata=compaction_metadata,
+            fast_mode=fast_mode,
         )
 
 
@@ -393,11 +543,24 @@ def _as_two_column_table(text: str) -> str:
     return "\n".join(rows)
 
 
-def _with_answer_timing(result: GroundedAnswerResult, started_at: float) -> GroundedAnswerResult:
+def _with_answer_timing(
+    result: GroundedAnswerResult,
+    started_at: float,
+    *,
+    cache_metadata: dict[str, bool],
+    compaction_metadata: dict[str, int],
+    fast_mode: bool,
+) -> GroundedAnswerResult:
     metadata = dict(result.service_metadata)
     timings = _extract_numeric_timings(metadata.get("timings_ms"))
     timings["answer_generation"] = elapsed_ms(started_at)
     metadata["timings_ms"] = timings
+    existing_cache = metadata.get("cache")
+    merged_cache = dict(existing_cache) if isinstance(existing_cache, dict) else {}
+    merged_cache.update(cache_metadata)
+    metadata["cache"] = merged_cache
+    metadata["compaction"] = compaction_metadata
+    metadata["fast_mode"] = fast_mode
     return replace(result, service_metadata=metadata)
 
 

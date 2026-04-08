@@ -100,25 +100,52 @@ class PgVectorSearcher:
         "ORDER BY embedding <=> %s::vector "
         "LIMIT %s"
     )
+    _SEARCH_SQL_WITH_SPEAKER = (
+        "SELECT chunk_id, meeting_id, speaker_label, start_time, end_time, content, "
+        "(1 - (embedding <=> %s::vector)) AS similarity "
+        "FROM meeting_transcripts "
+        "WHERE meeting_id = %s AND speaker_label = %s AND embedding IS NOT NULL "
+        "ORDER BY embedding <=> %s::vector "
+        "LIMIT %s"
+    )
 
     def __init__(self, connection: ConnectionProtocol) -> None:
         self._connection = connection
 
     def search_similar_chunks(
-        self, meeting_id: str, query_embedding: Sequence[float], top_k: int = 10
+        self,
+        meeting_id: str,
+        query_embedding: Sequence[float],
+        top_k: int = 10,
+        speaker_label: str | None = None,
     ) -> list[SimilarChunkResult]:
         validated_meeting_id = _validate_meeting_id(meeting_id)
         if top_k <= 0:
             raise ValueError("top_k must be a positive integer")
+        normalized_speaker = speaker_label.strip() if isinstance(speaker_label, str) else None
+        if normalized_speaker == "":
+            normalized_speaker = None
 
         validated_embedding = _validate_embedding(query_embedding)
         vector_literal = _to_pgvector_literal(validated_embedding)
 
         with self._connection.cursor() as cursor:
-            cursor.execute(
-                self._SEARCH_SQL,
-                (vector_literal, validated_meeting_id, vector_literal, top_k),
-            )
+            if normalized_speaker is None:
+                cursor.execute(
+                    self._SEARCH_SQL,
+                    (vector_literal, validated_meeting_id, vector_literal, top_k),
+                )
+            else:
+                cursor.execute(
+                    self._SEARCH_SQL_WITH_SPEAKER,
+                    (
+                        vector_literal,
+                        validated_meeting_id,
+                        normalized_speaker,
+                        vector_literal,
+                        top_k,
+                    ),
+                )
             rows = cursor.fetchall()
 
         return [
