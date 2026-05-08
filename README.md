@@ -246,6 +246,56 @@ uv run python run_eval.py --retrieval-benchmark-path data/eval/retrieval_benchma
 
 Evaluation details and expected fixtures are documented in `docs/evaluation.md`.
 
+## Evaluation Results
+
+Latest run (ES2002a):
+
+```bash
+uv run python run_eval.py \
+        --transcript-reference-path data/interim/ES2002a_ground_truth_words.json \
+        --transcript-prediction-path data/processed/ES2002a_turns.json \
+        --output-path data/eval/eval_summary.json
+```
+
+### Transcription
+
+- WER (lexical_word_error_rate): `0.5108` (~51.08%)
+- Word coverage ratio: `0.6609`
+- Reference words: `3105`
+- Predicted turn count: `162`
+
+Source: `data/eval/eval_summary.json`
+
+### Retrieval (MRR / P@K)
+
+- `MRR`: pending benchmark fixture + retrieval prediction artifacts
+- `P@K`: pending benchmark fixture + retrieval prediction artifacts
+
+To produce retrieval metrics with the current pipeline, run retrieval eval with a benchmark
+fixture (`data/eval/retrieval_benchmark.json`) and either precomputed predictions or
+`--live-retrieval`.
+
+### Sample Grounded Q&A (with confidence tier)
+
+Current environment status: unavailable until required local Ollama models are present.
+
+Attempted command:
+
+```bash
+uv run python scripts/smoke_rag.py --meeting-id ES2002a --question "What decisions were made?" --top-k 5 --debug --preview-evidence
+```
+
+Observed blocker:
+
+- Missing model: `qwen3:4b`
+- Missing model: `nomic-embed-text-v2-moe`
+
+After pulling those models, rerun the smoke command above and copy:
+
+- `answer.confidence_tier`
+- grounded `answer.sections`
+- retrieved `evidence` preview
+
 ## Demo: Recommended Flow
 For a clean live demo:
 
